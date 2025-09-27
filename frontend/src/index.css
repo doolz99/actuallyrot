@@ -12,6 +12,11 @@ body {
   @apply bg-black text-white;
 }
 
+/* Impact font utility */
+.font-impact {
+  font-family: Impact, Haettenschweiler, 'Arial Narrow Bold', sans-serif;
+}
+
 /* Strong glow/blink for paired circles */
 @keyframes glow-blink {
   0%, 100% {
@@ -43,6 +48,16 @@ body {
 
 .blink-caret {
   animation: caret-blink 1s step-end infinite;
+}
+
+/* Gate logo strobe */
+@keyframes logo-strobe {
+  0%, 20%, 40%, 60%, 80%, 100% { opacity: 1; transform: scale(1); }
+  10%, 30%, 50%, 70%, 90% { opacity: 0.35; transform: scale(1.02); }
+}
+
+.logo-strobe {
+  animation: logo-strobe 300ms steps(1, end) infinite;
 }
 
 @keyframes fly-up {

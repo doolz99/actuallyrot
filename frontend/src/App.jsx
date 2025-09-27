@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { io } from 'socket.io-client'
 import Circles from './Circles.jsx'
 import Chat from './Chat.jsx'
+import Gate from './Gate.jsx'
 import { playJoinSound, playPairSound, playSendSound, playReceiveSound, playConnectSound, playDisconnectSound } from './audio'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'
@@ -10,6 +11,10 @@ export default function App() {
   const socket = useMemo(() => io(BACKEND_URL, { autoConnect: true }), [])
 
   const [view, setView] = useState('lobby') // 'lobby' | 'chat'
+  // One-time gate per session
+  const [showGate, setShowGate] = useState(() => {
+    try { return sessionStorage.getItem('rv_seen_gate') ? false : true } catch { return true }
+  })
   const [users, setUsers] = useState([]) // array of { id }
   const [selfId, setSelfId] = useState(null)
   const [partnerId, setPartnerId] = useState(null)
@@ -18,6 +23,7 @@ export default function App() {
   const [partnerDraft, setPartnerDraft] = useState('')
   const [memories, setMemories] = useState([]) // all past messages beyond the last visible
   const [timesSnapshot, setTimesSnapshot] = useState({ nowMs: 0, perSocket: {} })
+  const [pairRot, setPairRot] = useState({}) // key "a|b" -> 'red'|'blue'|'none'
 
   // Stable per-device id (ephemeral in incognito)
   const deviceId = useMemo(() => {
@@ -108,6 +114,10 @@ export default function App() {
       if (!snap || typeof snap !== 'object') return
       setTimesSnapshot({ nowMs: Number(snap.nowMs) || Date.now(), perSocket: snap.perSocket || {} })
     })
+    socket.on('pair_rot_state', (snap) => {
+      if (!snap || typeof snap !== 'object') return
+      setPairRot(snap.rot || {})
+    })
 
     return () => {
       socket.off('connect', onConnect)
@@ -121,10 +131,14 @@ export default function App() {
       socket.off('typing')
       socket.off('pair_started')
       socket.off('pair_ended')
+      socket.off('pair_rot_state')
       socket.off('times_snapshot')
       socket.disconnect()
     }
   }, [socket, deviceId])
+  function handleRotState(type) {
+    try { socket.emit('rotting_state', { type }) } catch {}
+  }
 
   // Visible-only heartbeat every second
   useEffect(() => {
@@ -200,19 +214,25 @@ export default function App() {
 
   return (
     <div className="h-full bg-black text-white">
-      {view === 'lobby' && (
+      {showGate && (
+        <Gate onDone={() => { try { sessionStorage.setItem('rv_seen_gate', '1') } catch {} setShowGate(false) }} />
+      )}
+      {!showGate && view === 'lobby' && (
         <Circles
           selfId={selfId}
           users={users}
           pairs={pairs}
           timesBySocket={timesSnapshot.perSocket}
+          pairRot={pairRot}
           onRequestChat={handleRequestChat}
         />
       )}
-      {view === 'chat' && (
+      {!showGate && view === 'chat' && (
         <Chat
           selfId={selfId}
           partnerId={partnerId}
+          timesBySocket={timesSnapshot.perSocket}
+          onRotState={handleRotState}
           messages={messages}
           partnerDraft={partnerDraft}
           onSendMessage={handleSendMessage}

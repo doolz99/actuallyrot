@@ -1,10 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import panzoom from 'panzoom'
+import StaticBackground from './StaticBackground.jsx'
 
-export default function Circles({ selfId, users, pairs, timesBySocket = {}, onRequestChat }) {
+export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, onRequestChat }) {
   const viewportRef = useRef(null)
   const worldRef = useRef(null)
   const panzoomRef = useRef(null)
+  const hoverAudioRef = useRef(null)
+  const hoverCountRef = useRef(0)
+  const ambientAudioRef = useRef(null)
+  const ambientTimerRef = useRef(null)
   const worldWidth = 5000
   const worldHeight = 3500
   const others = users.filter(u => u.id !== selfId)
@@ -24,11 +29,16 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, onRe
     return Math.abs(hash)
   }
 
-  function hashToColor(key) {
-    const h = hashString(key) % 360
-    const s = 75
-    const l = 55
-    return `hsl(${h} ${s}% ${l}%)`
+  function hashToGray(key) {
+    const h = hashString(key) >>> 0
+    const lightness = 28 + (h % 55) // 28..82
+    return { color: `hsl(0 0% ${lightness}%)`, lightness }
+  }
+
+  function grayTextFor(lightness) {
+    const shifted = lightness < 50 ? lightness + 20 : lightness - 20
+    const clamp = Math.max(0, Math.min(100, shifted))
+    return `hsl(0 0% ${clamp}%)`
   }
 
   function makeClusterPlacer() {
@@ -83,6 +93,93 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, onRe
     panzoomRef.current = instance
     return () => instance.dispose()
   }, [])
+
+  // Shared hover audio (loops while hovering any circle)
+  useEffect(() => {
+    try {
+      const a = new Audio('/hover.mp3')
+      a.loop = true
+      a.preload = 'auto'
+      a.volume = 1
+      hoverAudioRef.current = a
+    } catch {}
+    return () => {
+      try { hoverAudioRef.current?.pause?.() } catch {}
+      hoverAudioRef.current = null
+    }
+  }, [])
+
+  // Ambient audio that slowly ramps volume the longer you're on the circles page
+  useEffect(() => {
+    try {
+      const a = new Audio('/ambient.mp3')
+      a.loop = true
+      a.preload = 'auto'
+      a.volume = 0
+      ambientAudioRef.current = a
+      const tryPlay = () => {
+        a.play().catch(() => {})
+      }
+      if (document.visibilityState === 'visible') {
+        if (a.readyState >= 1) tryPlay()
+        else a.addEventListener('loadedmetadata', tryPlay, { once: true })
+      }
+      const resumeOnInteract = () => {
+        tryPlay()
+        window.removeEventListener('pointerdown', resumeOnInteract)
+      }
+      window.addEventListener('pointerdown', resumeOnInteract)
+
+      const rampSeconds = 120
+      ambientTimerRef.current = setInterval(() => {
+        if (document.visibilityState !== 'visible') return
+        const audio = ambientAudioRef.current
+        if (!audio) return
+        const step = 1 / rampSeconds
+        const next = Math.min(1, (audio.volume || 0) + step)
+        try { audio.volume = next } catch {}
+      }, 1000)
+
+      const onVis = () => {
+        if (document.visibilityState === 'visible') tryPlay()
+        else { try { a.pause() } catch {} }
+      }
+      document.addEventListener('visibilitychange', onVis)
+
+      return () => {
+        document.removeEventListener('visibilitychange', onVis)
+        window.removeEventListener('pointerdown', resumeOnInteract)
+        if (ambientTimerRef.current) {
+          clearInterval(ambientTimerRef.current)
+          ambientTimerRef.current = null
+        }
+        try { ambientAudioRef.current?.pause?.() } catch {}
+        ambientAudioRef.current = null
+      }
+    } catch {
+      return () => {}
+    }
+  }, [])
+
+  function onHoverStart() {
+    hoverCountRef.current += 1
+    const a = hoverAudioRef.current
+    if (a && a.paused) {
+      a.currentTime = 0
+      a.play().catch(() => {})
+    }
+  }
+
+  function onHoverEnd() {
+    hoverCountRef.current = Math.max(0, hoverCountRef.current - 1)
+    if (hoverCountRef.current === 0) {
+      const a = hoverAudioRef.current
+      if (a) {
+        try { a.pause() } catch {}
+        try { a.currentTime = 0 } catch {}
+      }
+    }
+  }
 
   // Center viewport on the cluster whenever participants change
   useEffect(() => {
@@ -155,11 +252,12 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, onRe
   }, [others, pairs, timesBySocket, nowMs])
 
   return (
-    <div className="w-full h-full">
-      <h1 className="fixed top-4 left-1/2 -translate-x-1/2 text-5xl font-bold text-center z-10 pointer-events-none">RoTView</h1>
+    <div className="w-full h-full relative">
+      <StaticBackground opacity={0.06} fps={20} />
+      {/* Title removed per request */}
       <div
         ref={viewportRef}
-        className="fixed inset-0 overflow-hidden"
+        className="fixed inset-0 overflow-hidden z-[1]"
       >
         <div
           ref={worldRef}
@@ -172,24 +270,31 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, onRe
                 <>
                   {pairs.map(({ a, b }) => {
                     const key = [a, b].sort().join('|')
-                    const color = hashToColor(key)
+                    const { color, lightness } = hashToGray(key)
                     const pos = place(key)
                     const t = timesMemo.pairTotal.get(key) || 0
+                    const textColor = grayTextFor(lightness)
+                    const rot = pairRot[key]
+                    const tint = rot === 'blue' ? '#2da3ff' : rot === 'red' ? '#ff2d2d' : null
                     return (
                       <div
                         key={key}
                         className="absolute -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-full pair-glow"
-                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, backgroundColor: color, '--glowColor': color }}
+                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, backgroundColor: tint || color, '--glowColor': tint || color }}
                         title={`In chat`}
+                        onMouseEnter={onHoverStart}
+                        onMouseLeave={onHoverEnd}
                       >
-                        <div className="w-full h-full grid place-items-center text-xs text-black/80 font-mono">{msToHMS(t)}</div>
+                        <img src="/circle.gif" alt="" className="absolute inset-0 w-full h-full object-cover rounded-full pointer-events-none" style={{ opacity: 0.25 }} />
+                        <div className="w-full h-full grid place-items-center text-xs font-mono" style={{ color: textColor }}>{msToHMS(t)}</div>
                       </div>
                     )
                   })}
                   {others.filter(u => !pairedUserIds.has(u.id)).map((u) => {
-                    const color = hashToColor(u.id)
+                    const { color, lightness } = hashToGray(u.id)
                     const pos = place(u.id)
                     const t = timesMemo.single.get(u.id) || 0
+                    const textColor = grayTextFor(lightness)
                     return (
                       <button
                         key={u.id}
@@ -198,8 +303,11 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, onRe
                         style={{ left: `${pos.x}px`, top: `${pos.y}px`, backgroundColor: color, boxShadow: `0 0 12px ${color}` }}
                         title="Start chat"
                         aria-label="Start chat"
+                        onMouseEnter={onHoverStart}
+                        onMouseLeave={onHoverEnd}
                       >
-                        <div className="w-full h-full grid place-items-center text-[10px] text-black/80 font-mono">{msToHMS(t)}</div>
+                        <img src="/circle.gif" alt="" className="absolute inset-0 w-full h-full object-cover rounded-full pointer-events-none" style={{ opacity: 0.25 }} />
+                        <div className="w-full h-full grid place-items-center text-[10px] font-mono" style={{ color: textColor }}>{msToHMS(t)}</div>
                       </button>
                     )
                   })}

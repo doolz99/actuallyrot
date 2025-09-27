@@ -22,6 +22,9 @@ const io = new Server(server, {
 const users = new Map();
 // In-memory pairs store: pairKey (sorted "a|b") -> { a: string, b: string }
 const pairs = new Map();
+// Pair rot state: pairKey -> { state: 'red'|'blue'|'none', updatedAtMs: number }
+const pairRotState = new Map();
+const ROT_TTL_MS = 7000;
 
 // --- Device time tracking ---
 // deviceId -> { totalMs: number, lastCountedSec?: number, lastBeatMs?: number }
@@ -149,8 +152,30 @@ io.on('connection', (socket) => {
         rec.lastCountedSec = sec;
       }
       if (visible && recent && sec > rec.lastCountedSec) {
-        // Only increment by 1s per wall-second boundary crossed, no catch-up across gaps
-        rec.totalMs += 1000;
+        // Increment; apply rotting multiplier if applicable
+        let deltaSec = sec - rec.lastCountedSec;
+        // Cap single-step to avoid large catches (should normally be 1)
+        if (deltaSec > 3) deltaSec = 1;
+
+        let multiplier = 1;
+        // If in a pair and pair is red-rotting, apply 4x
+        const me = users.get(socket.id);
+        if (me && me.partnerId) {
+          const key = [me.id, me.partnerId].sort().join('|');
+          const rot = pairRotState.get(key);
+          if (rot && rot.state === 'red' && (nowMs - rot.updatedAtMs) <= ROT_TTL_MS) {
+            multiplier = 4;
+          }
+        }
+
+        rec.totalMs += deltaSec * 1000 * multiplier;
+        rec.lastCountedSec = sec;
+        schedulePersist();
+      } else if (!visible && recent && sec > rec.lastCountedSec) {
+        // Decrement while hidden
+        let deltaSec = sec - rec.lastCountedSec;
+        if (deltaSec > 3) deltaSec = 1;
+        rec.totalMs = Math.max(0, rec.totalMs - deltaSec * 1000);
         rec.lastCountedSec = sec;
         schedulePersist();
       } else if (sec > rec.lastCountedSec && !recent) {
@@ -162,6 +187,20 @@ io.on('connection', (socket) => {
     } catch (err) {
       // ignore
     }
+  });
+
+  // Rotting state reporting from clients
+  socket.on('rotting_state', ({ type }) => {
+    try {
+      const me = users.get(socket.id);
+      if (!me || !me.partnerId) return;
+      const a = me.id; const b = me.partnerId;
+      const key = [a, b].sort().join('|');
+      let next = 'none';
+      if (type === 'blue' || type === 'red') next = type;
+      // Set directly to the latest reported state; periodic TTL cleanup will clear stale values
+      pairRotState.set(key, { state: next, updatedAtMs: Date.now() });
+    } catch {}
   });
 
   socket.on('typing', ({ text }) => {
@@ -226,6 +265,17 @@ setInterval(() => {
     perSocket[id] = { totalMs: rec.totalMs, isActive };
   }
   io.emit('times_snapshot', { nowMs, perSocket });
+
+  // Expire stale rot states and broadcast snapshot
+  const rot = {};
+  for (const [key, val] of pairRotState.entries()) {
+    if (nowMs - val.updatedAtMs > ROT_TTL_MS) {
+      pairRotState.delete(key);
+    } else {
+      rot[key] = val.state;
+    }
+  }
+  io.emit('pair_rot_state', { rot });
 }, 1000);
 
 server.listen(PORT, () => {

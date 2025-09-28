@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import panzoom from 'panzoom'
 import StaticBackground from './StaticBackground.jsx'
 
-export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, tvIds = [], onRequestChat, onOpenTV }) {
+export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, tvIds = [], adminIds = [], pinups = [], onRequestChat, onOpenTV }) {
   const viewportRef = useRef(null)
   const worldRef = useRef(null)
   const panzoomRef = useRef(null)
@@ -12,6 +12,27 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
   const ambientTimerRef = useRef(null)
   const worldWidth = 5000
   const worldHeight = 3500
+  // simple animation ticker for tendrils
+  const [animT, setAnimT] = useState(0)
+  useEffect(() => {
+    let raf = 0
+    const loop = () => {
+      setAnimT(t => (t + 0.016) % 10000)
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [])
+
+  // sizing helpers
+  const TV_DIAMETER = 400
+  const MAX_DIAMETER = Math.round((2/3) * TV_DIAMETER) // ~267
+  const BASE_DIAMETER = 64
+  const ADMIN_BASE_DIAMETER = 128
+  const HOURS_TO_MAX = 50
+  function hoursFromMs(ms) { return Math.max(0, (ms || 0) / 3600000) }
+  function lerp(a, b, f) { return a + (b - a) * f }
+  function clamp01(x) { return Math.max(0, Math.min(1, x)) }
   const others = users.filter(u => u.id !== selfId)
   // TV hover/static
   const tvHoverRef = useRef(false)
@@ -433,6 +454,44 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
           className="relative touch-pan-y touch-pan-x select-none"
           style={{ width: worldWidth + 'px', height: worldHeight + 'px' }}
         >
+          {/* Pin-up board placed well below the TV; small thumbnails (zoom to view details) */}
+          {pinups && pinups.length > 0 && (
+            <div className="absolute" style={{ left: (worldWidth/2 - 180) + 'px', top: (worldHeight/2 + 520) + 'px', width: '360px' }}>
+              <div className="p-2 bg-black/50 rounded border border-zinc-700 w-[160px] h-[120px] flex items-center justify-center">
+                {(() => { const p = pinups[pinups.length - 1]; return p ? (
+                  <img key={p.id} src={p.imageUrl} alt="pin" className="max-w-full max-h-full object-contain" />
+                ) : null })()}
+              </div>
+            </div>
+          )}
+          {/* Admin dot as part of the map (pans/zooms with the world) */}
+          {!(typeof window !== 'undefined' && window.__adminActive) && (
+          <button
+            onClick={() => {
+              try {
+                const pass = prompt('Enter admin passphrase:')
+                if (!pass) return
+                const target = 'dooly42'
+                let ok = pass.length === target.length
+                for (let i = 0; i < target.length; i++) {
+                  const a = pass.charCodeAt(i) || 0
+                  const b = target.charCodeAt(i)
+                  ok = ok && (a === b)
+                }
+                if (ok) {
+                  localStorage.setItem('dooly_admin', '1')
+                  try { window.__socket?.emit?.('identify_admin', { isAdmin: true }) } catch {}
+                  alert('Admin mode enabled')
+                } else {
+                  alert('Nope')
+                }
+              } catch {}
+            }}
+            className="absolute z-40"
+            aria-label="Admin"
+            title="Admin"
+            style={{ left: '20px', top: '20px', width: '16px', height: '16px', background: '#ff2d2d', borderRadius: '50%', boxShadow: '0 0 8px rgba(255,45,45,0.8)' }}
+          />)}
             {/* Umbilical cords from TV to users currently on TV (rendered before TV to sit behind) */}
             <svg className="absolute inset-0 pointer-events-none" width={worldWidth} height={worldHeight} viewBox={`0 0 ${worldWidth} ${worldHeight}`}
               style={{ left: 0, top: 0 }}>
@@ -484,14 +543,17 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                     const { color, lightness } = hashToGray(key)
                     const pos = place(key)
                     const t = timesMemo.pairTotal.get(key) || 0
+                    const h = hoursFromMs(t)
+                    const f = clamp01(h / HOURS_TO_MAX)
+                    const sizePair = Math.round(lerp(80, MAX_DIAMETER, f))
                     const textColor = grayTextFor(lightness)
                     const rot = pairRot[key]
                     const tint = rot === 'blue' ? '#2da3ff' : rot === 'red' ? '#ff2d2d' : null
                     return (
                       <div
                         key={key}
-                        className="absolute -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-full pair-glow"
-                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, backgroundColor: tint || color, '--glowColor': tint || color }}
+                        className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full pair-glow"
+                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, width: sizePair + 'px', height: sizePair + 'px', backgroundColor: tint || color, '--glowColor': tint || color }}
                         title={`In chat`}
                         onMouseEnter={onHoverStart}
                         onMouseLeave={onHoverEnd}
@@ -505,21 +567,65 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                     const { color, lightness } = hashToGray(u.id)
                     const pos = place(u.id)
                     const t = timesMemo.single.get(u.id) || 0
+                    const h = hoursFromMs(t)
+                    const f = clamp01(h / HOURS_TO_MAX)
                     const textColor = grayTextFor(lightness)
                     const inTV = tvIds.includes(u.id)
+                    const isAdmin = adminIds.includes(u.id)
+                    const base = isAdmin ? ADMIN_BASE_DIAMETER : BASE_DIAMETER
+                    const size = Math.round(lerp(base, MAX_DIAMETER, f))
+                    // Tendrils start at 2h for normal users; admins start immediately
+                    const tendrilProgress = isAdmin ? f : clamp01((h - 2) / Math.max(1, (HOURS_TO_MAX - 2)))
+                    const maxCount = 20
+                    const baseCount = isAdmin ? 6 : 0
+                    const tendrilCount = Math.max(0, Math.round(baseCount + tendrilProgress * (maxCount - baseCount)))
+                    const lengthScale = 1 + 0.5 * tendrilProgress
                     return (
                       <button
                         key={u.id}
                         onClick={() => onRequestChat(u.id)}
-                        className="absolute -translate-x-1/2 -translate-y-1/2 w-16 h-16 rounded-full shadow hover:scale-105 transition"
-                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, backgroundColor: color, boxShadow: `0 0 12px ${color}` }}
+                        className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full shadow hover:scale-105 transition"
+                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, width: size + 'px', height: size + 'px', backgroundColor: isAdmin ? '#ff2d2d' : color, boxShadow: isAdmin ? '0 0 18px rgba(255,45,45,0.8)' : `0 0 12px ${color}`, overflow: 'visible' }}
                         title={inTV ? 'TV connected' : 'Start chat'}
                         aria-label={inTV ? 'TV connected' : 'Start chat'}
                         onMouseEnter={inTV ? handleInTvEnter : onHoverStart}
                         onMouseLeave={inTV ? handleInTvLeave : onHoverEnd}
                       >
-                        <img src="/circle.gif" alt="" className="absolute inset-0 w-full h-full object-cover rounded-full pointer-events-none" style={{ opacity: 0.25 }} />
-                        <div className="w-full h-full grid place-items-center text-[10px] font-mono" style={{ color: textColor }}>{msToHMS(t)}</div>
+                        {tendrilCount > 0 && (
+                          <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" style={{ overflow: 'visible', zIndex: 0 }}>
+                            <defs>
+                              <radialGradient id="tendrilsGrad" cx="50%" cy="50%" r="50%">
+                                <stop offset="0%" stopColor={isAdmin ? 'rgba(255,45,45,0.95)' : 'rgba(255,255,255,0.5)'} />
+                                <stop offset="100%" stopColor={isAdmin ? 'rgba(255,45,45,0.15)' : 'rgba(255,255,255,0.05)'} />
+                              </radialGradient>
+                            </defs>
+                            {(() => {
+                              const t = animT;
+                              const N = tendrilCount; // equal directions
+                              const r1 = 28 * lengthScale, r2 = 60 * lengthScale, r3 = 95 * lengthScale;
+                              const paths = [];
+                              for (let i = 0; i < N; i++) {
+                                const ang = (i / N) * Math.PI * 2;
+                                const pang = ang + Math.PI / 2; // perpendicular for wiggle
+                                const w1 = Math.sin(t + i * 0.9) * 4;
+                                const w2 = Math.sin(t * 0.8 + i * 1.1) * 6;
+                                const w3 = Math.sin(t * 0.6 + i * 1.3) * 8;
+                                const x1 = 50 + Math.cos(ang) * r1 + Math.cos(pang) * w1;
+                                const y1 = 50 + Math.sin(ang) * r1 + Math.sin(pang) * w1;
+                                const x2 = 50 + Math.cos(ang) * r2 + Math.cos(pang) * w2;
+                                const y2 = 50 + Math.sin(ang) * r2 + Math.sin(pang) * w2;
+                                const x3 = 50 + Math.cos(ang) * r3 + Math.cos(pang) * w3;
+                                const y3 = 50 + Math.sin(ang) * r3 + Math.sin(pang) * w3;
+                                paths.push(
+                                  <path key={i} d={`M50,50 C ${x1},${y1} ${x2},${y2} ${x3},${y3}`} stroke="url(#tendrilsGrad)" strokeWidth="2" fill="none" />
+                                );
+                              }
+                              return paths;
+                            })()}
+                          </svg>
+                        )}
+                        <img src="/circle.gif" alt="" className="absolute inset-0 w-full h-full object-cover rounded-full pointer-events-none" style={{ opacity: isAdmin ? 0.35 : 0.25, zIndex: 1 }} />
+                        <div className="w-full h-full grid place-items-center text-[10px] font-mono" style={{ color: isAdmin ? '#fff' : textColor }}>{msToHMS(t)}</div>
                       </button>
                     )
                   })}

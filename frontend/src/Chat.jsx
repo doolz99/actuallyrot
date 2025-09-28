@@ -2,7 +2,7 @@ import React, { useRef, useState, useEffect, useMemo } from 'react'
 import StaticBackground from './StaticBackground.jsx'
 import { hashString } from './color'
 
-export default function Chat({ selfId, partnerId, timesBySocket = {}, onRotState, messages, partnerDraft, onSendMessage, onTyping, onExit, memories = [] }) {
+export default function Chat({ selfId, partnerId, timesBySocket = {}, onRotState, messages, partnerDraft, onSendMessage, onTyping, onExit, memories = [], adminIds = [] }) {
   const [text, setText] = useState('')
   const bottomRef = useRef(null)
   const stageRef = useRef(null)
@@ -339,7 +339,7 @@ export default function Chat({ selfId, partnerId, timesBySocket = {}, onRotState
               </div>
             </div>
             {messages.map((m, idx) => (
-              <div ref={idx === 0 ? firstMsgRef : null} data-ts={m.timestamp} key={idx} className="leading-tight" style={{ fontSize: fontSizeFor(m.text) + 'px', color: m.from === selfId ? '#ffffff' : partnerTextColor }} title={new Date(m.timestamp).toLocaleTimeString()}>
+              <div ref={idx === 0 ? firstMsgRef : null} data-ts={m.timestamp} key={idx} className="leading-tight" style={{ fontSize: fontSizeFor(m.text) + 'px', color: adminIds.includes(m.from) ? '#ff2d2d' : (m.from === selfId ? '#ffffff' : partnerTextColor) }} title={new Date(m.timestamp).toLocaleTimeString()}>
                 {m.text}
               </div>
             ))}
@@ -373,7 +373,7 @@ export default function Chat({ selfId, partnerId, timesBySocket = {}, onRotState
               </div>
             </form>
             {!!partnerDraft && (
-              <div className="mt-2 italic font-impact" style={{ fontSize: fontSizeFor(partnerDraft) + 'px', color: partnerTextColor }}>
+              <div className="mt-2 italic font-impact" style={{ fontSize: fontSizeFor(partnerDraft) + 'px', color: adminIds.includes(partnerId) ? '#ff2d2d' : partnerTextColor }}>
                 {partnerDraft}
               </div>
             )}

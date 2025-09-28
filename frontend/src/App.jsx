@@ -26,6 +26,8 @@ export default function App() {
   const [timesSnapshot, setTimesSnapshot] = useState({ nowMs: 0, perSocket: {} })
   const [pairRot, setPairRot] = useState({}) // key "a|b" -> 'red'|'blue'|'none'
   const [tvIds, setTvIds] = useState([])
+  const [adminIds, setAdminIds] = useState([])
+  const [pinups, setPinups] = useState([])
 
   // Stable per-device id (ephemeral in incognito)
   const deviceId = useMemo(() => {
@@ -48,6 +50,10 @@ export default function App() {
       try { playConnectSound() } catch {}
       // Identify device once connected
       socket.emit('identify', { deviceId })
+      // expose socket for admin toggle helper
+      try { window.__socket = socket } catch {}
+      // re-identify as admin if toggled previously on this browser
+      try { if (localStorage.getItem('dooly_admin') === '1') socket.emit('identify_admin', { isAdmin: true }) } catch {}
     }
 
     function onUsers(list) {
@@ -111,6 +117,18 @@ export default function App() {
       return [...prev, { a, b }]
     }))
     socket.on('pair_ended', ({ a, b }) => setPairs(prev => prev.filter(p => [p.a, p.b].sort().join('|') !== [a, b].sort().join('|'))))
+    socket.on('admin_active', ({ active }) => {
+      try { window.__adminActive = !!active } catch {}
+    })
+    socket.on('admin_update', ({ ids }) => {
+      setAdminIds(Array.isArray(ids) ? ids : [])
+    })
+    socket.on('pinups', ({ list }) => {
+      setPinups(Array.isArray(list) ? list : [])
+    })
+    socket.on('pinups_update', ({ entry }) => {
+      setPinups(prev => [...prev.slice(-199), entry])
+    })
 
     socket.on('chat_blocked', ({ targetId }) => {
       try {
@@ -145,6 +163,10 @@ export default function App() {
       socket.off('typing')
       socket.off('pair_started')
       socket.off('pair_ended')
+      socket.off('admin_active')
+      socket.off('admin_update')
+      socket.off('pinups')
+      socket.off('pinups_update')
       socket.off('chat_blocked')
       socket.off('pair_rot_state')
       socket.off('tv_snapshot')
@@ -252,6 +274,8 @@ export default function App() {
           timesBySocket={timesSnapshot.perSocket}
           pairRot={pairRot}
           tvIds={tvIds}
+          adminIds={adminIds}
+          pinups={pinups}
           onRequestChat={handleRequestChat}
           onOpenTV={() => setView('tv')}
         />
@@ -268,10 +292,11 @@ export default function App() {
           onTyping={handleTyping}
           onExit={handleExitChat}
           memories={memories}
+          adminIds={adminIds}
         />
       )}
       {!showGate && view === 'tv' && (
-        <TV socket={socket} onExit={() => setView('lobby')} onEnterTV={() => socket.emit('tv_state', { inTv: true })} onLeaveTV={() => socket.emit('tv_state', { inTv: false })} onSetDnd={handleSetDnd} />
+        <TV socket={socket} adminIds={adminIds} onExit={() => setView('lobby')} onEnterTV={() => socket.emit('tv_state', { inTv: true })} onLeaveTV={() => socket.emit('tv_state', { inTv: false })} onSetDnd={handleSetDnd} />
       )}
       {/* Self timer bottom overlay */}
       {!!selfId && (

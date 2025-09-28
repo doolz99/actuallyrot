@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import TVFloatChat from './TVFloatChat.jsx'
 
-export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
+export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV, onSetDnd }) {
   const [dnd, setDnd] = useState(false)
   const [apiReady, setApiReady] = useState(false)
   const [room, setRoom] = useState(null) // { videoId, baseIndex, baseTs, playbackRate, isPlaying }
@@ -9,6 +9,13 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
   const [isMuted, setIsMuted] = useState(true)
   const PLAYLIST_ID = 'PLqI4z8Cwl_TD1siZWi93dzjs1p_r2MPP9'
   const [videoSize, setVideoSize] = useState({ width: 1280, height: 720, left: 0, top: 0 })
+  const [flash, setFlash] = useState(false)
+  const flashTimerRef = useRef(0)
+  const shutterRef = useRef(null)
+  const capStreamRef = useRef(null)
+  const capVideoRef = useRef(null)
+  const capCanvasRef = useRef(null)
+  const [captureReady, setCaptureReady] = useState(false)
 
   // Load YouTube IFrame API once
   useEffect(() => {
@@ -51,6 +58,113 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
     recalc()
     window.addEventListener('resize', recalc)
     return () => window.removeEventListener('resize', recalc)
+  }, [])
+
+  // Paparazzi flash on Right Alt
+  useEffect(() => {
+    function onKey(e) {
+      if (e.code === 'AltRight') {
+        e.preventDefault()
+        try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
+        // trigger locally and broadcast to others in TV
+        setFlash(true)
+        try { socket?.emit('tv_flash') } catch {}
+        try {
+          if (captureReady && capVideoRef.current) {
+            const dataUrl = grabSnapshot()
+            if (dataUrl) {
+              const vid = room?.videoId || playerRef.current?.getVideoData?.()?.video_id
+              socket?.emit('tv_pinup_add', { imageUrl: dataUrl, videoId: vid || '', ts: Date.now(), authorId: socket?.id })
+            }
+          } else {
+            const vid = room?.videoId || playerRef.current?.getVideoData?.()?.video_id
+            if (vid) {
+              const imageUrl = `https://img.youtube.com/vi/${vid}/mqdefault.jpg`
+              socket?.emit('tv_pinup_add', { imageUrl, videoId: vid, ts: Date.now(), authorId: socket?.id })
+            }
+          }
+        } catch {}
+        try { const a = shutterRef.current; if (a) { a.currentTime = 0; a.play().catch(() => {}) } } catch {}
+        flashTimerRef.current = setTimeout(() => setFlash(false), 120)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
+    }
+  }, [])
+  // Enable tab capture (user gesture required)
+  async function enableCapture() {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'never' }, audio: false })
+      capStreamRef.current = stream
+      if (!capVideoRef.current) {
+        const v = document.createElement('video')
+        v.muted = true
+        v.playsInline = true
+        capVideoRef.current = v
+      }
+      capVideoRef.current.srcObject = stream
+      await capVideoRef.current.play()
+      if (!capCanvasRef.current) capCanvasRef.current = document.createElement('canvas')
+      setCaptureReady(true)
+    } catch (err) {
+      setCaptureReady(false)
+    }
+  }
+
+  function grabSnapshot() {
+    try {
+      const video = capVideoRef.current
+      const canvas = capCanvasRef.current
+      if (!video || !canvas || !video.videoWidth || !video.videoHeight) return null
+      // Compute crop from player rect relative to the window
+      const vw = video.videoWidth, vh = video.videoHeight
+      const scaleX = vw / (window.innerWidth || vw)
+      const scaleY = vh / (window.innerHeight || vh)
+      const sx = Math.max(0, Math.floor(videoSize.left * scaleX))
+      const sy = Math.max(0, Math.floor(videoSize.top * scaleY))
+      const sw = Math.min(vw, Math.floor(videoSize.width * scaleX))
+      const sh = Math.min(vh, Math.floor(videoSize.height * scaleY))
+      const targetW = 480
+      const targetH = Math.round(targetW * (sh / Math.max(1, sw)))
+      canvas.width = targetW
+      canvas.height = targetH
+      const ctx = canvas.getContext('2d')
+      ctx.fillStyle = '#000'; ctx.fillRect(0,0,targetW,targetH)
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, targetW, targetH)
+      return canvas.toDataURL('image/jpeg', 0.75)
+    } catch {
+      return null
+    }
+  }
+
+
+  // Receive flash events from others
+  useEffect(() => {
+    if (!socket) return
+    const onFlash = () => {
+      try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
+      setFlash(true)
+      try { const a = shutterRef.current; if (a) { a.currentTime = 0; a.play().catch(() => {}) } } catch {}
+      flashTimerRef.current = setTimeout(() => setFlash(false), 120)
+    }
+    socket.on('tv_flash', onFlash)
+    // ensure we're in the tv room to receive
+    try { socket.emit('join_room', { roomId: 'tv' }) } catch {}
+    return () => { socket.off('tv_flash', onFlash); try { socket.emit('leave_room', { roomId: 'tv' }) } catch {} }
+  }, [socket])
+
+  // preload camera shutter audio
+  useEffect(() => {
+    try {
+      const a = new Audio('/camera.mp3')
+      a.preload = 'auto'
+      a.volume = 0.9
+      shutterRef.current = a
+    } catch {}
+    return () => { try { shutterRef.current = null } catch {} }
   }, [])
 
   // timesync offset
@@ -199,10 +313,18 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
 
   return (
     <div className="w-full h-full bg-black text-white relative">
+      {/* Flash overlay on top of everything */}
+      <div className={flash ? 'fixed inset-0 z-[9999] pointer-events-none bg-white opacity-100' : 'fixed inset-0 z-[9999] pointer-events-none bg-white opacity-0'} style={{ transition: 'opacity 120ms ease-out' }} />
       <button
         className="absolute top-3 left-3 z-50 text-xs text-zinc-400 hover:text-white"
         onClick={onExit}
       >Back</button>
+      {adminIds.includes(socket?.id) && !captureReady && (
+        <button
+          className="absolute top-3 right-3 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
+          onClick={enableCapture}
+        >Enable capture</button>
+      )}
       <button
         className="absolute bottom-3 left-3 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
         onClick={() => setDnd(v => !v)}
@@ -232,7 +354,7 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
           )}
           {/* Transient float chat overlay matching video area */}
           <div className="absolute inset-0 z-30" style={{ pointerEvents: 'none' }}>
-            <TVFloatChat socket={socket} width={videoSize.width} height={videoSize.height} />
+            <TVFloatChat socket={socket} adminIds={adminIds} width={videoSize.width} height={videoSize.height} />
           </div>
         </div>
       </div>

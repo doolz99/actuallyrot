@@ -32,6 +32,20 @@ const pairRotState = new Map();
 const ROT_TTL_MS = 7000;
 // Users who are not accepting chats (Do Not Disturb while on TV or otherwise)
 const dndUsers = new Set();
+// Admin sockets
+const adminSockets = new Set();
+// Pin-up board (in-memory, persisted to disk)
+let pinups = [];
+const PINUPS_PATH = path.join(__dirname, 'pinups.json');
+try {
+  if (fs.existsSync(PINUPS_PATH)) {
+    const data = JSON.parse(fs.readFileSync(PINUPS_PATH, 'utf8'))
+    if (Array.isArray(data)) pinups = data
+  }
+} catch {}
+function savePinups() {
+  try { fs.writeFileSync(PINUPS_PATH, JSON.stringify(pinups.slice(-200), null, 2), 'utf8') } catch {}
+}
 
 // ---- TV GLOBAL CLOCK (server-authoritative) ----
 // Authoritative playlist order (array of YouTube videoIds)
@@ -116,6 +130,10 @@ io.on('connection', (socket) => {
   socket.emit('users', existingUsers);
   // Send existing active pairs
   socket.emit('pairs', Array.from(pairs.values()));
+  // Send current admin sockets snapshot
+  socket.emit('admin_update', { ids: Array.from(adminSockets) });
+  // Send pinups
+  socket.emit('pinups', { list: pinups });
 
   // Notify others about the new user
   socket.broadcast.emit('user_joined', { id: user.id });
@@ -235,6 +253,37 @@ io.on('connection', (socket) => {
   socket.on('dnd_state', ({ on }) => {
     try {
       if (on) dndUsers.add(socket.id); else dndUsers.delete(socket.id);
+    } catch {}
+  });
+
+  // Admin identification (client-side gated for now)
+  socket.on('identify_admin', ({ isAdmin }) => {
+    try {
+      if (isAdmin) adminSockets.add(socket.id); else adminSockets.delete(socket.id);
+      io.emit('admin_active', { active: adminSockets.size > 0 });
+      io.emit('admin_update', { ids: Array.from(adminSockets) });
+    } catch {}
+  });
+
+  // TV paparazzi flash broadcast
+  socket.on('tv_flash', () => {
+    try { io.to('tv').emit('tv_flash', { at: Date.now() }); } catch {}
+  });
+
+  // Pinup add
+  socket.on('tv_pinup_add', ({ imageUrl, videoId, ts, authorId }) => {
+    try {
+      const entry = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+        imageUrl: String(imageUrl || ''),
+        videoId: String(videoId || ''),
+        ts: typeof ts === 'number' ? ts : Date.now(),
+        authorId: String(authorId || socket.id),
+      }
+      pinups.push(entry)
+      pinups = pinups.slice(-200)
+      savePinups()
+      io.emit('pinups_update', { entry })
     } catch {}
   });
 
@@ -386,6 +435,9 @@ io.on('connection', (socket) => {
       io.emit('tv_snapshot', { ids: Array.from(tvUsers) });
     }
     dndUsers.delete(socket.id);
+    adminSockets.delete(socket.id);
+    io.emit('admin_active', { active: adminSockets.size > 0 });
+    io.emit('admin_update', { ids: Array.from(adminSockets) });
   });
 });
 

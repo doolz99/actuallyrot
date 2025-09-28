@@ -19,7 +19,7 @@ function hashString(str) {
   return h >>> 0
 }
 
-export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
+export default function TVFloatChat({ socket, width = 1280, height = 260, adminIds = [] }) {
   const [messages, setMessages] = useState([]) // {id, text, ts}
   const [draft, setDraft] = useState('')
   const [seed, setSeed] = useState(() => Math.floor(Math.random()*1e9) >>> 0)
@@ -130,7 +130,7 @@ export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
         candidate = { x, y }
       }
       placed.push({ x: candidate.x, y: candidate.y, w, h })
-      boxes.push({ id: m.ts + ':' + m.id, x: candidate.x, y: candidate.y, w, h, fontPx, text: m.text })
+      boxes.push({ id: m.ts + ':' + m.id, senderId: m.id, x: candidate.x, y: candidate.y, w, h, fontPx, text: m.text })
     }
     // previews
     for (const [pid, pv] of previewsArg.entries()) {
@@ -223,14 +223,14 @@ export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
       <div ref={containerRef} className="absolute inset-0" style={{ pointerEvents: 'none' }}>
         {layout.map(b => (
           b.preview ? (
-            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: 'white', opacity: 0.8, textShadow: '0 0 8px rgba(255,80,80,0.45), 0 0 18px rgba(255,50,50,0.25)' }}>
+            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: adminIds.includes(b.id) ? '#ff2d2d' : 'white', opacity: 0.8, textShadow: adminIds.includes(b.id) ? '0 0 10px rgba(255,80,80,0.6), 0 0 22px rgba(255,50,50,0.35)' : '0 0 8px rgba(255,80,80,0.45), 0 0 18px rgba(255,50,50,0.25)' }}>
               {b.text}
               {b.mine && (
                 <span className="tv-caret" style={{ display: 'inline-block', width: '2px', height: '1em', background: 'white', marginLeft: '3px', verticalAlign: 'baseline' }} />
               )}
             </div>
           ) : (
-            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: 'white', textShadow: '0 0 10px rgba(255,80,80,0.6), 0 0 22px rgba(255,50,50,0.35)' }}>
+            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: adminIds.includes(b.senderId) ? '#ff2d2d' : 'white', textShadow: adminIds.includes(b.senderId) ? '0 0 10px rgba(255,80,80,0.8), 0 0 22px rgba(255,50,50,0.5)' : '0 0 12px rgba(255,255,255,0.6)' }}>
               {b.text}
             </div>
           )

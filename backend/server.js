@@ -1,4 +1,4 @@
-const express = require('express');
+testconst express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
@@ -50,7 +50,7 @@ let tvPaused = false;
 const deviceTimes = new Map();
 // socketId -> deviceId
 const socketToDevice = new Map();
-// socketId -> { visible: boolean, lastHeartbeatMs: number }
+// socketId -> { visible: boolean, lastHeartbeatMs: number, inactiveStreak: number, activeStreak: number, isActive: boolean }
 const socketActivity = new Map();
 
 const DATA_PATH = path.join(__dirname, 'times.json');
@@ -165,6 +165,9 @@ io.on('connection', (socket) => {
       text,
       timestamp: Date.now()
     });
+    // Treat chat activity as presence
+    const rec = socketActivity.get(socket.id);
+    if (rec) rec.lastHeartbeatMs = Date.now();
   });
 
   // Heartbeat: count at most 1s per real second when heartbeats are continuous and visible
@@ -211,7 +214,10 @@ io.on('connection', (socket) => {
         rec.lastCountedSec = sec;
       }
       rec.lastBeatMs = nowMs;
-      socketActivity.set(socket.id, { visible: !!visible, lastHeartbeatMs: nowMs });
+      const act = socketActivity.get(socket.id) || { visible: !!visible, lastHeartbeatMs: nowMs, inactiveStreak: 0, activeStreak: 0, isActive: true };
+      act.visible = !!visible;
+      act.lastHeartbeatMs = nowMs;
+      socketActivity.set(socket.id, act);
     } catch (err) {
       // ignore
     }
@@ -331,6 +337,9 @@ io.on('connection', (socket) => {
     const me = users.get(socket.id);
     if (!me || !me.partnerId) return;
     io.to(me.partnerId).emit('typing', { from: me.id, text, timestamp: Date.now() });
+    // Treat typing as presence
+    const rec = socketActivity.get(socket.id);
+    if (rec) rec.lastHeartbeatMs = Date.now();
   });
 
   socket.on('leave_chat', () => {
@@ -388,9 +397,24 @@ setInterval(() => {
     const deviceId = socketToDevice.get(id);
     if (!deviceId) continue;
     const rec = deviceTimes.get(deviceId) || { totalMs: 0 };
-    const act = socketActivity.get(id);
-    const isActive = !!(act && act.visible && (nowMs - act.lastHeartbeatMs) < 2500);
-    perSocket[id] = { totalMs: rec.totalMs, isActive };
+    // Presence smoothing with grace/hysteresis
+    const a = socketActivity.get(id) || { visible: false, lastHeartbeatMs: 0, inactiveStreak: 0, activeStreak: 0, isActive: false };
+    const GRACE_MS = 6500; // allow up to 6.5s between beats
+    const recentlyBeat = (nowMs - a.lastHeartbeatMs) < GRACE_MS;
+    const shouldBeActive = !!(a.visible && recentlyBeat);
+    if (shouldBeActive) {
+      a.activeStreak += 1;
+      a.inactiveStreak = 0;
+      // flip active immediately on first active tick
+      if (!a.isActive && a.activeStreak >= 1) a.isActive = true;
+    } else {
+      a.inactiveStreak += 1;
+      a.activeStreak = 0;
+      // require 3 consecutive inactive evaluations to flip to inactive
+      if (a.isActive && a.inactiveStreak >= 3) a.isActive = false;
+    }
+    socketActivity.set(id, a);
+    perSocket[id] = { totalMs: rec.totalMs, isActive: !!a.isActive };
   }
   io.emit('times_snapshot', { nowMs, perSocket });
 

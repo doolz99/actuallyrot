@@ -42,6 +42,7 @@ export default function Gate({ onDone, stillSrc = '/doors_still.png', gifSrc = '
   }, [gifSrc, audioSrc])
 
   function start() {
+    if (isMobile) return
     if (phase !== 'idle') return
     setPhase('playing')
     const playMs = Math.max(0, gifMs - Math.max(0, cullMs))

@@ -166,12 +166,19 @@ export default function App() {
     }
     timer = setInterval(beat, 1000)
     const onVis = () => beat()
+    const onInput = () => beat()
     document.addEventListener('visibilitychange', onVis)
     window.addEventListener('focus', onVis)
+    window.addEventListener('pageshow', onVis)
+    window.addEventListener('pointerdown', onInput)
+    window.addEventListener('keydown', onInput)
     return () => {
       if (timer) clearInterval(timer)
       document.removeEventListener('visibilitychange', onVis)
       window.removeEventListener('focus', onVis)
+      window.removeEventListener('pageshow', onVis)
+      window.removeEventListener('pointerdown', onInput)
+      window.removeEventListener('keydown', onInput)
     }
   }, [socket])
 

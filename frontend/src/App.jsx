@@ -28,6 +28,38 @@ export default function App() {
   const [tvIds, setTvIds] = useState([])
   const [adminIds, setAdminIds] = useState([])
   const [pinups, setPinups] = useState([])
+  const [hasData, setHasData] = useState(false)
+  const [stuck, setStuck] = useState(false)
+  const [epoch, setEpoch] = useState(0)
+
+  // Helpers to dedupe incoming state (defensive against backend races)
+  const dedupeUsers = (list) => {
+    try {
+      const seen = new Set()
+      const out = []
+      for (const u of Array.isArray(list) ? list : []) {
+        if (!u || !u.id) continue
+        if (seen.has(u.id)) continue
+        seen.add(u.id)
+        out.push({ id: u.id })
+      }
+      return out
+    } catch { return [] }
+  }
+  const dedupePairs = (list) => {
+    try {
+      const seen = new Set()
+      const out = []
+      for (const p of Array.isArray(list) ? list : []) {
+        if (!p || !p.a || !p.b) continue
+        const key = [p.a, p.b].sort().join('|')
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push({ a: p.a, b: p.b })
+      }
+      return out
+    } catch { return [] }
+  }
 
   // Stable per-device id (ephemeral in incognito)
   const deviceId = useMemo(() => {
@@ -57,20 +89,27 @@ export default function App() {
     }
 
     function onUsers(list) {
-      setUsers(list)
+      setUsers(dedupeUsers(list))
+      setHasData(true)
     }
 
     function onPairs(list) {
-      setPairs(list)
+      setPairs(dedupePairs(list))
+      setHasData(true)
     }
 
     function onUserJoined(user) {
-      setUsers(prev => [...prev, user])
-      try { playJoinSound() } catch {}
+      setUsers(prev => {
+        const list = Array.isArray(prev) ? prev : []
+        const exists = list.some(u => u && u.id === user?.id)
+        const next = exists ? list : dedupeUsers([...list, user])
+        if (!exists) { try { playJoinSound() } catch {} }
+        return next
+      })
     }
 
     function onUserLeft(user) {
-      setUsers(prev => prev.filter(u => u.id !== user.id))
+      setUsers(prev => (prev || []).filter(u => u.id !== user.id))
     }
 
     function onMatchStarted({ partnerId }) {
@@ -100,7 +139,22 @@ export default function App() {
     }
 
     socket.on('connect', onConnect)
+    // If already connected before handlers bound (refresh race), run onConnect immediately
+    if (socket.connected) {
+      try { onConnect() } catch {}
+    } else {
+      // Fallback: attempt identify shortly after mount regardless of connect event ordering
+      setTimeout(() => { try { socket.emit('identify', { deviceId }) } catch {} }, 500)
+    }
     socket.on('users', onUsers)
+    // Request fresh snapshots after identify to avoid blank UI on refresh
+    const req = () => {
+      try {
+        socket.emit('tv_request_state')
+        socket.emit('identify', { deviceId })
+      } catch {}
+    }
+    const t = setTimeout(req, 250)
     socket.on('pairs', onPairs)
     socket.on('user_joined', onUserJoined)
     socket.on('user_left', onUserLeft)
@@ -141,6 +195,7 @@ export default function App() {
     socket.on('times_snapshot', (snap) => {
       if (!snap || typeof snap !== 'object') return
       setTimesSnapshot({ nowMs: Number(snap.nowMs) || Date.now(), perSocket: snap.perSocket || {} })
+      setHasData(true)
     })
     socket.on('pair_rot_state', (snap) => {
       if (!snap || typeof snap !== 'object') return
@@ -171,6 +226,7 @@ export default function App() {
       socket.off('pair_rot_state')
       socket.off('tv_snapshot')
       socket.off('times_snapshot')
+      clearTimeout(t)
       socket.disconnect()
     }
   }, [socket, deviceId])
@@ -178,7 +234,7 @@ export default function App() {
     try { socket.emit('rotting_state', { type }) } catch {}
   }
 
-  // Visible-only heartbeat every second
+  // Visible-only heartbeat every second (start immediately on mount to avoid blank until first connect)
   useEffect(() => {
     let timer = null
     function beat() {
@@ -186,6 +242,7 @@ export default function App() {
         socket.emit('heartbeat', { now: Date.now(), visible: document.visibilityState === 'visible' })
       } catch {}
     }
+    beat()
     timer = setInterval(beat, 1000)
     const onVis = () => beat()
     const onInput = () => beat()
@@ -203,6 +260,21 @@ export default function App() {
       window.removeEventListener('keydown', onInput)
     }
   }, [socket])
+
+  // Detect stuck boot (no data after 2s) and offer a soft reinit
+  useEffect(() => {
+    setStuck(false)
+    const t = setTimeout(() => { if (!hasData) setStuck(true) }, 2000)
+    return () => clearTimeout(t)
+  }, [hasData, epoch])
+
+  function softReinit() {
+    try { socket.connect() } catch {}
+    try { socket.emit('identify', { deviceId }) } catch {}
+    setEpoch(e => e + 1)
+    setHasData(false)
+    setStuck(false)
+  }
 
   function handleRequestChat(targetId) {
     socket.emit('request_chat', { targetId })
@@ -262,7 +334,7 @@ export default function App() {
   }
 
   return (
-    <div className={`h-full bg-black text-white ${view === 'tv' ? 'overflow-hidden' : ''}`}>
+    <div className={`h-full bg-black text-white ${view === 'tv' ? 'overflow-hidden' : ''}`} key={epoch}>
       {showGate && (
         <Gate onDone={() => { try { sessionStorage.setItem('rv_seen_gate', '1') } catch {} setShowGate(false) }} />
       )}
@@ -308,6 +380,14 @@ export default function App() {
       {view === 'chat' && !!partnerId && (
         <div className="fixed top-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white font-mono text-sm">
           {formatHMS(effectiveMsFor(partnerId))}
+        </div>
+      )}
+      {stuck && (
+        <div className="fixed inset-0 z-[999] grid place-items-center pointer-events-none">
+          <div className="pointer-events-auto px-4 py-2 rounded bg-white/10 border border-white/20 text-xs text-zinc-200">
+            <div className="mb-2">Waking up…</div>
+            <button onClick={softReinit} className="px-3 py-1 rounded bg-white/10 hover:bg-white/20">Retry</button>
+          </div>
         </div>
       )}
     </div>

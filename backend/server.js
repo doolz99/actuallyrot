@@ -122,22 +122,13 @@ app.get('/', (_req, res) => {
 });
 
 io.on('connection', (socket) => {
-  const user = { id: socket.id, partnerId: null };
-  users.set(socket.id, user);
-
-  // Send existing users to the new client (exclude self)
-  const existingUsers = Array.from(users.values()).filter(u => u.id !== socket.id);
-  socket.emit('users', existingUsers);
+  // On connect, send non-user state snapshots; defer user registration until identify
   // Send existing active pairs
   socket.emit('pairs', Array.from(pairs.values()));
   // Send current admin sockets snapshot
   socket.emit('admin_update', { ids: Array.from(adminSockets) });
   // Send pinups
   socket.emit('pinups', { list: pinups });
-
-  // Notify others about the new user
-  socket.broadcast.emit('user_joined', { id: user.id });
-
   // Send current TV users snapshot
   socket.emit('tv_snapshot', { ids: Array.from(tvUsers) });
 
@@ -146,6 +137,28 @@ io.on('connection', (socket) => {
     if (!deviceId || typeof deviceId !== 'string') return;
     socketToDevice.set(socket.id, deviceId);
     ensureDevice(deviceId);
+
+    // Deduplicate by device: disconnect older sockets from same device
+    try {
+      for (const [otherId, dev] of socketToDevice.entries()) {
+        if (dev === deviceId && otherId !== socket.id) {
+          const other = io.sockets.sockets.get(otherId);
+          try { other?.disconnect(true); } catch {}
+        }
+      }
+    } catch {}
+
+    // Register user only after identify to avoid ghost circles
+    if (!users.has(socket.id)) {
+      users.set(socket.id, { id: socket.id, partnerId: null });
+    }
+    // Send users list (exclude self)
+    try {
+      const existingUsers = Array.from(users.values()).filter(u => u.id !== socket.id);
+      socket.emit('users', existingUsers);
+    } catch {}
+    // Notify others about the new user
+    try { socket.broadcast.emit('user_joined', { id: socket.id }); } catch {}
   });
 
   socket.on('request_chat', ({ targetId }) => {
@@ -427,8 +440,10 @@ io.on('connection', (socket) => {
       }
     }
 
-    users.delete(socket.id);
-    socket.broadcast.emit('user_left', { id: socket.id });
+    if (users.has(socket.id)) {
+      users.delete(socket.id);
+      socket.broadcast.emit('user_left', { id: socket.id });
+    }
     socketToDevice.delete(socket.id);
     socketActivity.delete(socket.id);
     if (tvUsers.delete(socket.id)) {

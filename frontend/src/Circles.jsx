@@ -179,8 +179,9 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     })
     panzoomRef.current = instance
     // Center viewport on the TV circle when entering the circles page
-    try {
-      if (viewportRef.current) {
+    const centerOnTV = () => {
+      try {
+        if (!viewportRef.current) return
         const { clientWidth, clientHeight } = viewportRef.current
         const tvX = worldWidth / 2
         const tvY = worldHeight / 2
@@ -188,8 +189,11 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
         const targetX = clientWidth / 2 - tvX * scale
         const targetY = clientHeight / 2 - tvY * scale
         instance.moveTo(targetX, targetY)
-      }
-    } catch {}
+      } catch {}
+    }
+    centerOnTV()
+    // Ensure after layout/transform settles
+    try { requestAnimationFrame(centerOnTV) } catch {}
     return () => instance.dispose()
   }, [])
 
@@ -387,7 +391,19 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     others.filter(u => !pairedUserIds.has(u.id)).forEach(u => {
       positions.push(place(u.id))
     })
-    if (positions.length === 0) return
+    if (positions.length === 0) {
+      // No users yet: center on TV to avoid empty black view
+      try {
+        const { clientWidth, clientHeight } = viewportRef.current
+        const tvX = worldWidth / 2
+        const tvY = worldHeight / 2
+        const scale = instance.getTransform().scale
+        const targetX = clientWidth / 2 - tvX * scale
+        const targetY = clientHeight / 2 - tvY * scale
+        instance.moveTo(targetX, targetY)
+      } catch {}
+      return
+    }
     const cx = positions.reduce((s,p)=>s+p.x,0) / positions.length
     const cy = positions.reduce((s,p)=>s+p.y,0) / positions.length
     const { clientWidth, clientHeight } = viewportRef.current
@@ -642,8 +658,8 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                       </button>
                     )
                   })}
-                  {/* Self circle when not in a pair */}
-                  {!pairedUserIds.has(selfId) && (() => {
+                  {/* Self circle when not in a pair (guard until selfId is known) */}
+                  {selfId && !pairedUserIds.has(selfId) && (() => {
                     const place = makeClusterPlacer()
                     const pos = place(selfId)
                     const h = hoursFromMs(effectiveMsForSocket(selfId))

@@ -16,6 +16,11 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
   const capVideoRef = useRef(null)
   const capCanvasRef = useRef(null)
   const [captureReady, setCaptureReady] = useState(false)
+  const [captureWarn, setCaptureWarn] = useState(false)
+  const [capturing, setCapturing] = useState(false)
+  const bootStartRef = useRef(Date.now())
+  const lastStateRef = useRef(Date.now())
+  const [stalled, setStalled] = useState(false)
 
   // Load YouTube IFrame API once
   useEffect(() => {
@@ -62,20 +67,54 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
 
   // Paparazzi flash on Right Alt
   useEffect(() => {
-    function onKey(e) {
+    async function onKey(e) {
       if (e.code === 'AltRight') {
         e.preventDefault()
         try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
-        // trigger locally and broadcast to others in TV
-        setFlash(true)
-        try { socket?.emit('tv_flash') } catch {}
         try {
           if (captureReady && capVideoRef.current) {
-            const dataUrl = grabSnapshot()
-            if (dataUrl) {
-              const vid = room?.videoId || playerRef.current?.getVideoData?.()?.video_id
-              socket?.emit('tv_pinup_add', { imageUrl: dataUrl, videoId: vid || '', ts: Date.now(), authorId: socket?.id })
-            }
+            setCapturing(true)
+            let uiNodes = []
+            let prevDisplayMap = null
+            try {
+              // Hard-hide UI synchronously to avoid being captured
+              uiNodes = Array.from(document.querySelectorAll('.tv-ui'))
+              prevDisplayMap = new Map(uiNodes.map(n => [n, n.style.display]))
+              uiNodes.forEach(n => { try { n.style.display = 'none' } catch {} })
+              // allow layout to apply hidden UI state before grabbing
+              await new Promise(r => requestAnimationFrame(() => r()))
+              // ensure a couple of frames render without UI
+              await waitNextVideoFrame(capVideoRef.current, 2)
+              let dataUrl = null
+              for (let i = 0; i < 3 && !dataUrl; i++) {
+                dataUrl = grabSnapshot()
+                if (!dataUrl) { await new Promise(r => setTimeout(r, 150)); await waitNextVideoFrame(capVideoRef.current, 1) }
+              }
+              if (dataUrl) {
+                const vid = room?.videoId || playerRef.current?.getVideoData?.()?.video_id
+                socket?.emit('tv_pinup_add', { imageUrl: dataUrl, videoId: vid || '', ts: Date.now(), authorId: socket?.id })
+                try { triggerDownload(dataUrl, `rotview_${Date.now()}.jpg`) } catch {}
+              } else {
+                setCaptureWarn(true)
+                setTimeout(() => setCaptureWarn(false), 1200)
+                // fallback to thumbnail
+                const vid = room?.videoId || playerRef.current?.getVideoData?.()?.video_id
+                if (vid) {
+                  const imageUrl = `https://img.youtube.com/vi/${vid}/mqdefault.jpg`
+                  socket?.emit('tv_pinup_add', { imageUrl, videoId: vid, ts: Date.now(), authorId: socket?.id })
+                }
+              }
+            } catch {}
+            // trigger locally and broadcast to others after capture, so overlays don't get into the frame
+            setFlash(true)
+            try { socket?.emit('tv_flash') } catch {}
+            try { const a = shutterRef.current; if (a) { a.currentTime = 0; a.play().catch(() => {}) } } catch {}
+            flashTimerRef.current = setTimeout(() => setFlash(false), 120)
+            // restore UI slightly after flash, then clear capturing
+            setTimeout(() => {
+              try { uiNodes.forEach(n => { try { n.style.display = (prevDisplayMap?.get(n)) || '' } catch {} }) } catch {}
+              setCapturing(false)
+            }, 220)
           } else {
             const vid = room?.videoId || playerRef.current?.getVideoData?.()?.video_id
             if (vid) {
@@ -84,8 +123,6 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
             }
           }
         } catch {}
-        try { const a = shutterRef.current; if (a) { a.currentTime = 0; a.play().catch(() => {}) } } catch {}
-        flashTimerRef.current = setTimeout(() => setFlash(false), 120)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -93,7 +130,7 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
       window.removeEventListener('keydown', onKey)
       try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
     }
-  }, [])
+  }, [captureReady, room?.videoId, socket])
   // Enable tab capture (user gesture required)
   async function enableCapture() {
     try {
@@ -105,8 +142,15 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
         v.playsInline = true
         capVideoRef.current = v
       }
-      capVideoRef.current.srcObject = stream
-      await capVideoRef.current.play()
+      const v = capVideoRef.current
+      v.srcObject = stream
+      await v.play().catch(() => {})
+      await new Promise(resolve => {
+        const check = () => {
+          if (v.videoWidth && v.videoHeight) { resolve() } else { setTimeout(check, 100) }
+        }
+        check()
+      })
       if (!capCanvasRef.current) capCanvasRef.current = document.createElement('canvas')
       setCaptureReady(true)
     } catch (err) {
@@ -114,19 +158,47 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     }
   }
 
+  function waitNextVideoFrame(video, count = 1) {
+    return new Promise(resolve => {
+      if (!video) return resolve()
+      let remaining = Math.max(1, count)
+      const done = () => { remaining--; if (remaining <= 0) resolve(); else step() }
+      const step = () => {
+        try {
+          if (video.requestVideoFrameCallback) {
+            video.requestVideoFrameCallback(() => done())
+          } else {
+            setTimeout(done, 66)
+          }
+        } catch {
+          setTimeout(done, 66)
+        }
+      }
+      step()
+    })
+  }
+
   function grabSnapshot() {
     try {
       const video = capVideoRef.current
       const canvas = capCanvasRef.current
       if (!video || !canvas || !video.videoWidth || !video.videoHeight) return null
-      // Compute crop from player rect relative to the window
+      // Compute crop from the exact tv-player bounding rect
+      const host = document.getElementById('tv-player')
+      if (!host) return null
+      const rect = host.getBoundingClientRect()
       const vw = video.videoWidth, vh = video.videoHeight
       const scaleX = vw / (window.innerWidth || vw)
       const scaleY = vh / (window.innerHeight || vh)
-      const sx = Math.max(0, Math.floor(videoSize.left * scaleX))
-      const sy = Math.max(0, Math.floor(videoSize.top * scaleY))
-      const sw = Math.min(vw, Math.floor(videoSize.width * scaleX))
-      const sh = Math.min(vh, Math.floor(videoSize.height * scaleY))
+      let sx = Math.floor(rect.left * scaleX)
+      let sy = Math.floor(rect.top * scaleY)
+      let sw = Math.floor(rect.width * scaleX)
+      let sh = Math.floor(rect.height * scaleY)
+      // Clamp to bounds
+      sx = Math.max(0, Math.min(sx, vw - 1))
+      sy = Math.max(0, Math.min(sy, vh - 1))
+      sw = Math.max(1, Math.min(sw, vw - sx))
+      sh = Math.max(1, Math.min(sh, vh - sy))
       const targetW = 480
       const targetH = Math.round(targetW * (sh / Math.max(1, sw)))
       canvas.width = targetW
@@ -138,6 +210,15 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     } catch {
       return null
     }
+  }
+
+  function triggerDownload(dataUrl, filename) {
+    const a = document.createElement('a')
+    a.href = dataUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    setTimeout(() => { document.body.removeChild(a) }, 0)
   }
 
 
@@ -218,6 +299,34 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     })
   }, [apiReady])
 
+  // Watchdog: if no state/playing within a few seconds after refresh, ask server and retry play
+  useEffect(() => {
+    const start = Date.now()
+    const check = setInterval(() => {
+      const p = playerRef.current
+      const elapsed = Date.now() - start
+      try {
+        const st = p?.getPlayerState?.()
+        if (st === window.YT?.PlayerState?.PLAYING || st === window.YT?.PlayerState?.BUFFERING) {
+          setStalled(false)
+          clearInterval(check)
+          return
+        }
+      } catch {}
+      if (elapsed > 5000) {
+        setStalled(true)
+        try {
+          socket?.emit?.('tv_request_state')
+          if (p) {
+            // force a tiny re-init attempt
+            p.playVideo?.()
+          }
+        } catch {}
+      }
+    }, 750)
+    return () => clearInterval(check)
+  }, [socket])
+
   function onReady() {
     try {
       const p = playerRef.current
@@ -227,13 +336,13 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
         // Seed playlist order: shuffle + load playlist
         try { p.setShuffle(true) } catch {}
         try { p.cuePlaylist({ list: PLAYLIST_ID }) } catch {}
-        setTimeout(() => { try { p.playVideo() } catch {} }, 100)
+        setTimeout(() => { try { p.playVideo() } catch {} }, 200)
         setTimeout(() => {
           try {
             const order = p.getPlaylist?.() || []
             if (Array.isArray(order) && order.length) socket?.emit('tv_playlist', { order })
           } catch {}
-        }, 1500)
+        }, 2000)
       }
     } catch {}
   }
@@ -315,30 +424,46 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     <div className="w-full h-full bg-black text-white relative">
       {/* Flash overlay on top of everything */}
       <div className={flash ? 'fixed inset-0 z-[9999] pointer-events-none bg-white opacity-100' : 'fixed inset-0 z-[9999] pointer-events-none bg-white opacity-0'} style={{ transition: 'opacity 120ms ease-out' }} />
-      <button
-        className="absolute top-3 left-3 z-50 text-xs text-zinc-400 hover:text-white"
-        onClick={onExit}
-      >Back</button>
-      {adminIds.includes(socket?.id) && !captureReady && (
+      {!capturing && (
         <button
-          className="absolute top-3 right-3 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
+          className="tv-ui absolute top-3 left-3 z-50 text-xs text-zinc-400 hover:text-white"
+          onClick={onExit}
+        >Back</button>
+      )}
+      {!capturing && adminIds.includes(socket?.id) && !captureReady && (
+        <button
+          className="tv-ui absolute top-3 right-3 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
           onClick={enableCapture}
         >Enable capture</button>
       )}
-      <button
-        className="absolute bottom-3 left-3 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
-        onClick={() => setDnd(v => !v)}
-      >{dnd ? 'DND: ON (no chats)' : 'DND: OFF (allow chats)'}</button>
+      {!capturing && captureReady && (
+        <div className="tv-ui absolute top-3 right-3 z-50 text-[10px] px-2 py-1 rounded bg-green-600/30 border border-green-400/60">
+          Capture ON
+        </div>
+      )}
+      {captureWarn && (
+        <div className="tv-ui absolute top-8 right-3 z-50 text-[10px] px-2 py-1 rounded bg-yellow-600/30 border border-yellow-400/60">
+          No frames yet
+        </div>
+      )}
+      {!capturing && (
+        <button
+          className="tv-ui absolute bottom-3 left-3 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
+          onClick={() => setDnd(v => !v)}
+        >{dnd ? 'DND: ON (no chats)' : 'DND: OFF (allow chats)'}</button>
+      )}
       <div className="w-full h-full relative">
         {/* Video area centered with letterboxing */}
         <div className="absolute bg-black" style={{ width: videoSize.width + 'px', height: videoSize.height + 'px', left: videoSize.left + 'px', top: videoSize.top + 'px' }}>
           <div id="tv-player" className="bg-black" style={{ width: '100%', height: '100%' }} />
           {/* Click blocker to keep visual-only */}
-          <div className="absolute inset-0 z-20" style={{ pointerEvents: 'auto' }} />
+          {!capturing && (
+            <div className="tv-ui absolute inset-0 z-20" style={{ pointerEvents: 'auto' }} />
+          )}
           {/* Enable sound button */}
-          {isMuted && (
+          {!capturing && isMuted && (
             <button
-              className="absolute bottom-3 right-3 z-30 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
+              className="tv-ui absolute bottom-3 right-3 z-30 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
               onClick={() => {
                 try {
                   const p = playerRef.current
@@ -353,9 +478,11 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
             >Enable sound</button>
           )}
           {/* Transient float chat overlay matching video area */}
-          <div className="absolute inset-0 z-30" style={{ pointerEvents: 'none' }}>
-            <TVFloatChat socket={socket} adminIds={adminIds} width={videoSize.width} height={videoSize.height} />
-          </div>
+          {!capturing && (
+            <div className="tv-ui absolute inset-0 z-30" style={{ pointerEvents: 'none' }}>
+              <TVFloatChat socket={socket} adminIds={adminIds} width={videoSize.width} height={videoSize.height} />
+            </div>
+          )}
         </div>
       </div>
     </div>

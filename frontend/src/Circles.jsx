@@ -12,6 +12,8 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
   const ambientTimerRef = useRef(null)
   const worldWidth = 5000
   const worldHeight = 3500
+  const isLocalAdmin = () => { try { return localStorage.getItem('dooly_admin') === '1' } catch { return false } }
+  const isAdminId = (id) => adminIds.includes(id) || (id === selfId && isLocalAdmin())
   // simple animation ticker for tendrils
   const [animT, setAnimT] = useState(0)
   useEffect(() => {
@@ -443,6 +445,17 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
 
   return (
     <div className="w-full h-full relative">
+      {/* Local admin logout button */}
+      {isLocalAdmin() && (
+        <button
+          className="fixed top-2 left-2 z-50 px-2 py-1 text-[10px] rounded bg-white/10 hover:bg-white/20 text-white"
+          onClick={() => {
+            try { localStorage.removeItem('dooly_admin') } catch {}
+            try { window.__socket?.emit?.('identify_admin', { isAdmin: false }) } catch {}
+            try { window.__adminActive = false } catch {}
+          }}
+        >Logout admin</button>
+      )}
       <StaticBackground opacity={0.06} fps={20} />
       {/* TV button is rendered inside the world (pans/zooms) */}
       <div
@@ -571,7 +584,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                     const f = clamp01(h / HOURS_TO_MAX)
                     const textColor = grayTextFor(lightness)
                     const inTV = tvIds.includes(u.id)
-                    const isAdmin = adminIds.includes(u.id)
+                    const isAdmin = isAdminId(u.id)
                     const base = isAdmin ? ADMIN_BASE_DIAMETER : BASE_DIAMETER
                     const size = Math.round(lerp(base, MAX_DIAMETER, f))
                     // Tendrils start at 2h for normal users; admins start immediately
@@ -629,6 +642,66 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                       </button>
                     )
                   })}
+                  {/* Self circle when not in a pair */}
+                  {!pairedUserIds.has(selfId) && (() => {
+                    const place = makeClusterPlacer()
+                    const pos = place(selfId)
+                    const h = hoursFromMs(effectiveMsForSocket(selfId))
+                    const f = clamp01(h / HOURS_TO_MAX)
+                    const isAdmin = isAdminId(selfId)
+                    const base = isAdmin ? ADMIN_BASE_DIAMETER : BASE_DIAMETER
+                    const size = Math.round(lerp(base, MAX_DIAMETER, f))
+                    const tendrilProgress = isAdmin ? f : clamp01((h - 2) / Math.max(1, (HOURS_TO_MAX - 2)))
+                    const maxCount = 20
+                    const baseCount = isAdmin ? 6 : 0
+                    const tendrilCount = Math.max(0, Math.round(baseCount + tendrilProgress * (maxCount - baseCount)))
+                    const lengthScale = 1 + 0.5 * tendrilProgress
+                    const color = isAdmin ? '#ff2d2d' : hashToGray(selfId).color
+                    const textColor = '#fff'
+                    const t = effectiveMsForSocket(selfId)
+                    return (
+                      <div
+                        key={'self'}
+                        className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full shadow"
+                        style={{ left: `${pos.x}px`, top: `${pos.y}px`, width: size + 'px', height: size + 'px', backgroundColor: color, boxShadow: isAdmin ? '0 0 18px rgba(255,45,45,0.8)' : `0 0 12px ${color}`, overflow: 'visible' }}
+                        title={'You'}
+                      >
+                        {tendrilCount > 0 && (
+                          <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" style={{ overflow: 'visible', zIndex: 0 }}>
+                            <defs>
+                              <radialGradient id="tendrilsGradSelf" cx="50%" cy="50%" r="50%">
+                                <stop offset="0%" stopColor={isAdmin ? 'rgba(255,45,45,0.95)' : 'rgba(255,255,255,0.5)'} />
+                                <stop offset="100%" stopColor={isAdmin ? 'rgba(255,45,45,0.15)' : 'rgba(255,255,255,0.05)'} />
+                              </radialGradient>
+                            </defs>
+                            {(() => {
+                              const tnow = animT
+                              const N = tendrilCount
+                              const r1 = 28 * lengthScale, r2 = 60 * lengthScale, r3 = 95 * lengthScale
+                              const paths = []
+                              for (let i = 0; i < N; i++) {
+                                const ang = (i / N) * Math.PI * 2
+                                const pang = ang + Math.PI / 2
+                                const w1 = Math.sin(tnow + i * 0.9) * 4
+                                const w2 = Math.sin(tnow * 0.8 + i * 1.1) * 6
+                                const w3 = Math.sin(tnow * 0.6 + i * 1.3) * 8
+                                const x1 = 50 + Math.cos(ang) * r1 + Math.cos(pang) * w1
+                                const y1 = 50 + Math.sin(ang) * r1 + Math.sin(pang) * w1
+                                const x2 = 50 + Math.cos(ang) * r2 + Math.cos(pang) * w2
+                                const y2 = 50 + Math.sin(ang) * r2 + Math.sin(pang) * w2
+                                const x3 = 50 + Math.cos(ang) * r3 + Math.cos(pang) * w3
+                                const y3 = 50 + Math.sin(ang) * r3 + Math.sin(pang) * w3
+                                paths.push(<path key={i} d={`M50,50 C ${x1},${y1} ${x2},${y2} ${x3},${y3}`} stroke="url(#tendrilsGradSelf)" strokeWidth="2" fill="none" />)
+                              }
+                              return paths
+                            })()}
+                          </svg>
+                        )}
+                        <img src="/circle.gif" alt="" className="absolute inset-0 w-full h-full object-cover rounded-full pointer-events-none" style={{ opacity: isAdmin ? 0.35 : 0.25, zIndex: 1 }} />
+                        <div className="w-full h-full grid place-items-center text-[10px] font-mono" style={{ color: textColor }}>{msToHMS(t)}</div>
+                      </div>
+                    )
+                  })()}
                 </>
               )
             })()}

@@ -65,6 +65,23 @@ export function playSendSound() {
   o.stop(now + 0.13)
 }
 
+// Quieter short beep for TV float chat send
+export function playTvSendSound() {
+  const ctx = getCtx()
+  const now = ctx.currentTime
+  const o = ctx.createOscillator()
+  const g = ctx.createGain()
+  o.type = 'square'
+  o.frequency.setValueAtTime(520, now)
+  o.frequency.linearRampToValueAtTime(740, now + 0.07)
+  g.gain.setValueAtTime(0.00005, now) // very quiet
+  g.gain.exponentialRampToValueAtTime(0.06, now + 0.01)
+  g.gain.exponentialRampToValueAtTime(0.00005, now + 0.11)
+  o.connect(g).connect(ctx.destination)
+  o.start(now)
+  o.stop(now + 0.12)
+}
+
 export function playReceiveSound() {
   const ctx = getCtx()
   const now = ctx.currentTime

@@ -8,8 +8,7 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
   const playerRef = useRef(null)
   const [isMuted, setIsMuted] = useState(true)
   const PLAYLIST_ID = 'PLqI4z8Cwl_TD1siZWi93dzjs1p_r2MPP9'
-  const [chatOverlap, setChatOverlap] = useState(0)
-  const [scale, setScale] = useState(1)
+  const [videoSize, setVideoSize] = useState({ width: 1280, height: 720, left: 0, top: 0 })
 
   // Load YouTube IFrame API once
   useEffect(() => {
@@ -33,22 +32,21 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
     return () => {}
   }, [])
 
-  // Compute chat overlap so page doesn't scroll; scale to fill width
+  // Compute 16:9 fit inside viewport (no cropping, letterboxing when needed)
   useEffect(() => {
     function recalc() {
-      const baseW = 1280
-      const baseVideoH = 720
-      const baseChatH = 220
-      const margin = 8
-      const sw = (window.innerWidth || baseW) / baseW
-      const sh = (window.innerHeight || (baseVideoH + margin + baseChatH)) / (baseVideoH + margin + baseChatH)
-      const nextScale = Math.min(sw, sh) // scale up or down to fit both width and height
-      const totalScaled = (baseVideoH + margin + baseChatH) * nextScale
-      const avail = window.innerHeight || totalScaled
-      const overScaled = Math.max(0, totalScaled - avail)
-      setScale(nextScale)
-      // Convert scaled overlap back to unscaled px so our marginTop compensation works pre-scale
-      setChatOverlap(overScaled / (nextScale || 1))
+      const vw = window.innerWidth || 1280
+      const vh = window.innerHeight || 720
+      const aspect = 16 / 9
+      let width = vw
+      let height = Math.floor(vw / aspect)
+      if (height > vh) {
+        height = vh
+        width = Math.floor(vh * aspect)
+      }
+      const left = Math.floor((vw - width) / 2)
+      const top = Math.floor((vh - height) / 2)
+      setVideoSize({ width, height, left, top })
     }
     recalc()
     window.addEventListener('resize', recalc)
@@ -209,22 +207,33 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
         className="absolute bottom-3 left-3 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
         onClick={() => setDnd(v => !v)}
       >{dnd ? 'DND: ON (no chats)' : 'DND: OFF (allow chats)'}</button>
-      <div className="w-full h-full flex flex-col items-center" style={{ transform: `scale(${scale})`, transformOrigin: 'top center' }}>
-        <div className="relative" style={{ width: '1280px', height: '720px' }}>
-          <div id="tv-player" className="w-[1280px] h-[720px] bg-black" />
+      <div className="w-full h-full relative">
+        {/* Video area centered with letterboxing */}
+        <div className="absolute bg-black" style={{ width: videoSize.width + 'px', height: videoSize.height + 'px', left: videoSize.left + 'px', top: videoSize.top + 'px' }}>
+          <div id="tv-player" className="bg-black" style={{ width: '100%', height: '100%' }} />
           {/* Click blocker to keep visual-only */}
           <div className="absolute inset-0 z-20" style={{ pointerEvents: 'auto' }} />
           {/* Enable sound button */}
           {isMuted && (
             <button
               className="absolute bottom-3 right-3 z-30 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
-              onClick={() => { try { playerRef.current?.unMute?.(); setIsMuted(false) } catch {} }}
+              onClick={() => {
+                try {
+                  const p = playerRef.current
+                  if (!p) return
+                  p.unMute?.()
+                  p.setVolume?.(100)
+                  // some browsers require a play() call after unmuting
+                  try { p.playVideo?.() } catch {}
+                  setIsMuted(false)
+                } catch {}
+              }}
             >Enable sound</button>
           )}
-        </div>
-        {/* Transient float chat below, background fully transparent */}
-        <div style={{ marginTop: Math.max(0, 8 - chatOverlap) + 'px' }}>
-          <TVFloatChat socket={socket} width={1280} height={220} />
+          {/* Transient float chat overlay matching video area */}
+          <div className="absolute inset-0 z-30" style={{ pointerEvents: 'none' }}>
+            <TVFloatChat socket={socket} width={videoSize.width} height={videoSize.height} />
+          </div>
         </div>
       </div>
     </div>

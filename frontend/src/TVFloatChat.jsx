@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { playTvSendSound } from './audio'
 
 function mulberry32(a) {
   return function() {
@@ -183,6 +184,7 @@ export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
     socket?.emit('tv_message', { text: t, seed })
     setDraft('')
     setSeed((seed + 1) >>> 0)
+    try { playTvSendSound() } catch {}
   }
 
   // hidden input capture
@@ -193,6 +195,12 @@ export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
     window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onFocus)
     return () => { window.removeEventListener('focus', onFocus); document.removeEventListener('visibilitychange', onFocus) }
+  }, [])
+  // Global click-to-refocus (captures events even if overlays eat them)
+  useEffect(() => {
+    const refocus = () => { setTimeout(() => { try { inputRef.current?.focus?.() } catch {} }, 0) }
+    window.addEventListener('pointerdown', refocus, true)
+    return () => window.removeEventListener('pointerdown', refocus, true)
   }, [])
   // Immediate local echo of my preview; throttle network emits to ~10/s
   useEffect(() => {
@@ -215,14 +223,14 @@ export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
       <div ref={containerRef} className="absolute inset-0" style={{ pointerEvents: 'none' }}>
         {layout.map(b => (
           b.preview ? (
-            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: 'white', opacity: 0.8, textShadow: '0 0 10px rgba(255,255,255,0.4)' }}>
+            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: 'white', opacity: 0.8, textShadow: '0 0 8px rgba(255,80,80,0.45), 0 0 18px rgba(255,50,50,0.25)' }}>
               {b.text}
               {b.mine && (
                 <span className="tv-caret" style={{ display: 'inline-block', width: '2px', height: '1em', background: 'white', marginLeft: '3px', verticalAlign: 'baseline' }} />
               )}
             </div>
           ) : (
-            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: 'white', textShadow: '0 0 12px rgba(255,255,255,0.6)' }}>
+            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: 'white', textShadow: '0 0 10px rgba(255,80,80,0.6), 0 0 22px rgba(255,50,50,0.35)' }}>
               {b.text}
             </div>
           )
@@ -238,12 +246,11 @@ export default function TVFloatChat({ socket, width = 1280, height = 260 }) {
           if (e.key === 'Escape') { setDraft('') }
           if (e.key === 'Tab') { e.preventDefault(); setSeed((seed + 2654435761) >>> 0) }
         }}
-        className="opacity-0 absolute"
+        className="opacity-0 absolute pointer-events-none"
         style={{ width: '1px', height: '1px', left: 0, top: 0 }}
         aria-hidden="true"
       />
-      {/* Click to refocus typing */}
-      <div className="absolute inset-0" style={{ pointerEvents: 'auto' }} onMouseDown={() => { try { inputRef.current?.focus?.() } catch {} }} />
+      {/* No clickable overlay; global pointerdown focuses input */}
     </div>
   )
 }

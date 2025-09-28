@@ -155,6 +155,18 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
       zoomDoubleClickSpeed: 1,
     })
     panzoomRef.current = instance
+    // Center viewport on the TV circle when entering the circles page
+    try {
+      if (viewportRef.current) {
+        const { clientWidth, clientHeight } = viewportRef.current
+        const tvX = worldWidth / 2
+        const tvY = worldHeight / 2
+        const scale = instance.getTransform().scale
+        const targetX = clientWidth / 2 - tvX * scale
+        const targetY = clientHeight / 2 - tvY * scale
+        instance.moveTo(targetX, targetY)
+      }
+    } catch {}
     return () => instance.dispose()
   }, [])
 
@@ -514,9 +526,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                 </>
               )
             })()}
-            {others.filter(u => !pairedUserIds.has(u.id)).length === 0 && pairs.length === 0 && (
-              <p className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-gray-400">No other users yet. Open another tab.</p>
-            )}
+            {/* Removed empty-state text */}
         </div>
       </div>
     </div>

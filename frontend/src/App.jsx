@@ -3,6 +3,7 @@ import { io } from 'socket.io-client'
 import Circles from './Circles.jsx'
 import Chat from './Chat.jsx'
 import Gate from './Gate.jsx'
+import TV from './TV.jsx'
 import { playJoinSound, playPairSound, playSendSound, playReceiveSound, playConnectSound, playDisconnectSound } from './audio'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'
@@ -10,7 +11,7 @@ const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'
 export default function App() {
   const socket = useMemo(() => io(BACKEND_URL, { autoConnect: true }), [])
 
-  const [view, setView] = useState('lobby') // 'lobby' | 'chat'
+  const [view, setView] = useState('lobby') // 'lobby' | 'chat' | 'tv'
   // One-time gate per session
   const [showGate, setShowGate] = useState(() => {
     try { return sessionStorage.getItem('rv_seen_gate') ? false : true } catch { return true }
@@ -24,6 +25,7 @@ export default function App() {
   const [memories, setMemories] = useState([]) // all past messages beyond the last visible
   const [timesSnapshot, setTimesSnapshot] = useState({ nowMs: 0, perSocket: {} })
   const [pairRot, setPairRot] = useState({}) // key "a|b" -> 'red'|'blue'|'none'
+  const [tvIds, setTvIds] = useState([])
 
   // Stable per-device id (ephemeral in incognito)
   const deviceId = useMemo(() => {
@@ -110,6 +112,14 @@ export default function App() {
     }))
     socket.on('pair_ended', ({ a, b }) => setPairs(prev => prev.filter(p => [p.a, p.b].sort().join('|') !== [a, b].sort().join('|'))))
 
+    socket.on('chat_blocked', ({ targetId }) => {
+      try {
+        const a = new Audio('/tv_focus.mp3')
+        a.volume = 1
+        a.play().catch(() => {})
+      } catch {}
+    })
+
     socket.on('times_snapshot', (snap) => {
       if (!snap || typeof snap !== 'object') return
       setTimesSnapshot({ nowMs: Number(snap.nowMs) || Date.now(), perSocket: snap.perSocket || {} })
@@ -117,6 +127,10 @@ export default function App() {
     socket.on('pair_rot_state', (snap) => {
       if (!snap || typeof snap !== 'object') return
       setPairRot(snap.rot || {})
+    })
+    socket.on('tv_snapshot', (snap) => {
+      if (!snap || typeof snap !== 'object') return
+      setTvIds(Array.isArray(snap.ids) ? snap.ids : [])
     })
 
     return () => {
@@ -131,7 +145,9 @@ export default function App() {
       socket.off('typing')
       socket.off('pair_started')
       socket.off('pair_ended')
+      socket.off('chat_blocked')
       socket.off('pair_rot_state')
+      socket.off('tv_snapshot')
       socket.off('times_snapshot')
       socket.disconnect()
     }
@@ -161,6 +177,10 @@ export default function App() {
 
   function handleRequestChat(targetId) {
     socket.emit('request_chat', { targetId })
+  }
+
+  function handleSetDnd(on) {
+    try { socket.emit('dnd_state', { on: !!on }) } catch {}
   }
 
   function handleSendMessage(text) {
@@ -213,7 +233,7 @@ export default function App() {
   }
 
   return (
-    <div className="h-full bg-black text-white">
+    <div className={`h-full bg-black text-white ${view === 'tv' ? 'overflow-hidden' : ''}`}>
       {showGate && (
         <Gate onDone={() => { try { sessionStorage.setItem('rv_seen_gate', '1') } catch {} setShowGate(false) }} />
       )}
@@ -224,7 +244,9 @@ export default function App() {
           pairs={pairs}
           timesBySocket={timesSnapshot.perSocket}
           pairRot={pairRot}
+          tvIds={tvIds}
           onRequestChat={handleRequestChat}
+          onOpenTV={() => setView('tv')}
         />
       )}
       {!showGate && view === 'chat' && (
@@ -240,6 +262,9 @@ export default function App() {
           onExit={handleExitChat}
           memories={memories}
         />
+      )}
+      {!showGate && view === 'tv' && (
+        <TV socket={socket} onExit={() => setView('lobby')} onEnterTV={() => socket.emit('tv_state', { inTv: true })} onLeaveTV={() => socket.emit('tv_state', { inTv: false })} onSetDnd={handleSetDnd} />
       )}
       {/* Self timer bottom overlay */}
       {!!selfId && (

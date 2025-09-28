@@ -4,11 +4,14 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
+const timesyncServer = require('timesync/server');
 
 const PORT = process.env.PORT || 3001;
 
 const app = express();
 app.use(cors({ origin: '*'}));
+// Timesync endpoint for NTP-like client clock sync
+app.use('/timesync', timesyncServer.requestHandler);
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -22,9 +25,25 @@ const io = new Server(server, {
 const users = new Map();
 // In-memory pairs store: pairKey (sorted "a|b") -> { a: string, b: string }
 const pairs = new Map();
+// Users currently in TV view: Set of socketIds
+const tvUsers = new Set();
 // Pair rot state: pairKey -> { state: 'red'|'blue'|'none', updatedAtMs: number }
 const pairRotState = new Map();
 const ROT_TTL_MS = 7000;
+// Users who are not accepting chats (Do Not Disturb while on TV or otherwise)
+const dndUsers = new Set();
+
+// ---- TV GLOBAL CLOCK (server-authoritative) ----
+// Authoritative playlist order (array of YouTube videoIds)
+let tvPlaylistOrder = null;
+// Video durations map (videoId -> seconds)
+const tvDurations = new Map();
+// Base index into playlist and base timestamp (ms) when current video started
+let tvBaseIndex = 0;
+let tvBaseTs = 0;
+// Playback properties
+let tvPlaybackRate = 1;
+let tvPaused = false;
 
 // --- Device time tracking ---
 // deviceId -> { totalMs: number, lastCountedSec?: number, lastBeatMs?: number }
@@ -101,6 +120,9 @@ io.on('connection', (socket) => {
   // Notify others about the new user
   socket.broadcast.emit('user_joined', { id: user.id });
 
+  // Send current TV users snapshot
+  socket.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+
   // Device identification
   socket.on('identify', ({ deviceId }) => {
     if (!deviceId || typeof deviceId !== 'string') return;
@@ -114,6 +136,12 @@ io.on('connection', (socket) => {
 
     if (!requester || !target) return;
     if (requester.partnerId || target.partnerId) return; // one is busy
+
+    // Respect DND: target is not accepting chats
+    if (dndUsers.has(target.id)) {
+      io.to(requester.id).emit('chat_blocked', { targetId: target.id });
+      return;
+    }
 
     requester.partnerId = target.id;
     target.partnerId = requester.id;
@@ -189,6 +217,84 @@ io.on('connection', (socket) => {
     }
   });
 
+  // TV state (user enters/exits TV view)
+  socket.on('tv_state', ({ inTv }) => {
+    try {
+      if (inTv) tvUsers.add(socket.id); else tvUsers.delete(socket.id);
+      io.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+    } catch {}
+  });
+
+  // Do Not Disturb toggle (prevent chat pairing attempts)
+  socket.on('dnd_state', ({ on }) => {
+    try {
+      if (on) dndUsers.add(socket.id); else dndUsers.delete(socket.id);
+    } catch {}
+  });
+
+  // --- TV room membership ---
+  socket.on('join_room', ({ roomId }) => {
+    try {
+      if (roomId === 'tv') socket.join('tv');
+      if (roomId === 'tv') {
+        const state = computeTvRoomState();
+        if (state) io.to(socket.id).emit('tv_room_state', state);
+      }
+    } catch {}
+  });
+  socket.on('leave_room', ({ roomId }) => {
+    try {
+      if (roomId === 'tv') socket.leave('tv');
+    } catch {}
+  });
+
+  // Followers request current TV state
+  socket.on('tv_request_state', () => {
+    try {
+      const state = computeTvRoomState();
+      if (state) socket.emit('tv_room_state', state);
+    } catch {}
+  });
+
+  // Bootstrap: first ready client reports playlist order (shuffled by client)
+  socket.on('tv_playlist', ({ order }) => {
+    try {
+      if (!Array.isArray(order) || order.length === 0) return;
+      if (!tvPlaylistOrder || tvPlaylistOrder.length === 0) {
+        tvPlaylistOrder = order.slice();
+        tvBaseIndex = 0;
+        tvBaseTs = Date.now();
+        tvPlaybackRate = 1;
+        tvPaused = false;
+        const state = computeTvRoomState();
+        if (state) io.to('tv').emit('tv_room_state', state);
+      }
+    } catch {}
+  });
+
+  // Clients report known duration for current video when available
+  socket.on('tv_duration', ({ videoId, duration }) => {
+    try {
+      if (typeof videoId !== 'string') return;
+      const d = Number(duration);
+      if (!isFinite(d) || d <= 0) return;
+      tvDurations.set(videoId, d);
+    } catch {}
+  });
+
+  // A client detected that current video ended (safety advance)
+  socket.on('tv_ended', ({ videoId }) => {
+    try {
+      if (!tvPlaylistOrder || tvPlaylistOrder.length === 0) return;
+      const currentId = tvPlaylistOrder[tvBaseIndex];
+      if (videoId && videoId !== currentId) return;
+      tvBaseIndex = (tvBaseIndex + 1) % tvPlaylistOrder.length;
+      tvBaseTs = Date.now();
+      const state = computeTvRoomState();
+      if (state) io.to('tv').emit('tv_room_state', state);
+    } catch {}
+  });
+
   // Rotting state reporting from clients
   socket.on('rotting_state', ({ type }) => {
     try {
@@ -200,6 +306,24 @@ io.on('connection', (socket) => {
       if (type === 'blue' || type === 'red') next = type;
       // Set directly to the latest reported state; periodic TTL cleanup will clear stale values
       pairRotState.set(key, { state: next, updatedAtMs: Date.now() });
+    } catch {}
+  });
+
+  // --- TV transient chat: relay only, no storage ---
+  socket.on('tv_message', ({ text, seed }) => {
+    try {
+      if (typeof text !== 'string' || !text.trim()) return;
+      const payload = { id: socket.id, text: String(text).slice(0, 500), ts: Date.now(), seed: Number(seed) || 0 };
+      io.to('tv').emit('tv_message', payload);
+    } catch {}
+  });
+
+  socket.on('tv_typing_preview', ({ seed, text }) => {
+    try {
+      const s = Number(seed) || 0;
+      const t = typeof text === 'string' ? text.slice(0, 500) : '';
+      const payload = { id: socket.id, seed: s, text: t, ts: Date.now() };
+      io.to('tv').volatile.emit('tv_typing_preview', payload);
     } catch {}
   });
 
@@ -249,6 +373,10 @@ io.on('connection', (socket) => {
     socket.broadcast.emit('user_left', { id: socket.id });
     socketToDevice.delete(socket.id);
     socketActivity.delete(socket.id);
+    if (tvUsers.delete(socket.id)) {
+      io.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+    }
+    dndUsers.delete(socket.id);
   });
 });
 
@@ -276,7 +404,42 @@ setInterval(() => {
     }
   }
   io.emit('pair_rot_state', { rot });
+
+  // --- TV global clock advance (server-authoritative) ---
+  if (tvPlaylistOrder && tvPlaylistOrder.length > 0) {
+    const nowMs = Date.now();
+    const currentId = tvPlaylistOrder[tvBaseIndex];
+    const dur = tvDurations.get(currentId);
+    if (!tvPaused && typeof dur === 'number' && dur > 0) {
+      const elapsed = (nowMs - tvBaseTs) * tvPlaybackRate;
+      if (elapsed >= dur * 1000) {
+        tvBaseIndex = (tvBaseIndex + 1) % tvPlaylistOrder.length;
+        tvBaseTs = nowMs;
+        const state = computeTvRoomState();
+        if (state) io.to('tv').emit('tv_room_state', state);
+      }
+    }
+    // Always broadcast current state once per tick so followers can converge
+    const state = computeTvRoomState();
+    if (state) io.to('tv').emit('tv_room_state', state);
+  }
 }, 1000);
+
+function computeTvRoomState() {
+  try {
+    if (!tvPlaylistOrder || tvPlaylistOrder.length === 0) return null;
+    const videoId = tvPlaylistOrder[tvBaseIndex];
+    return {
+      videoId,
+      baseIndex: tvBaseIndex,
+      baseTs: tvBaseTs,
+      playbackRate: tvPlaybackRate,
+      isPlaying: !tvPaused,
+    };
+  } catch {
+    return null;
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);

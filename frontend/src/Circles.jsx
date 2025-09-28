@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import panzoom from 'panzoom'
 import StaticBackground from './StaticBackground.jsx'
 
-export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, onRequestChat }) {
+export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, tvIds = [], onRequestChat, onOpenTV }) {
   const viewportRef = useRef(null)
   const worldRef = useRef(null)
   const panzoomRef = useRef(null)
@@ -13,6 +13,13 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
   const worldWidth = 5000
   const worldHeight = 3500
   const others = users.filter(u => u.id !== selfId)
+  // TV hover/static
+  const tvHoverRef = useRef(false)
+  const [tvHover, setTvHover] = useState(false)
+  const tvCanvasRef = useRef(null)
+  const tvTimerRef = useRef(null)
+  const tvAudioRef = useRef(null)
+  const tvHoverCountRef = useRef(0)
   // Build a set of userIds that are currently paired
   const pairedUserIds = new Set()
   pairs.forEach(({ a, b }) => {
@@ -41,6 +48,33 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     return `hsl(0 0% ${clamp}%)`
   }
 
+  // Build a wavy SVG path between two points
+  function buildWavePath(x1, y1, x2, y2) {
+    const dx = x2 - x1
+    const dy = y2 - y1
+    const len = Math.hypot(dx, dy) || 1
+    const ux = dx / len
+    const uy = dy / len
+    // perpendicular
+    const nx = -uy
+    const ny = ux
+    const steps = Math.max(16, Math.floor(len / 40))
+    const waves = Math.max(2, Math.floor(len / 180))
+    const amp = Math.min(24, Math.max(8, len * 0.06))
+    const q = (v) => Math.round(v) // snap to integer px to reduce shimmer
+    let d = `M ${q(x1)} ${q(y1)}`
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      const bx = x1 + dx * t
+      const by = y1 + dy * t
+      const offset = Math.sin(t * waves * Math.PI * 2) * amp
+      const px = bx + nx * offset
+      const py = by + ny * offset
+      d += ` L ${q(px)} ${q(py)}`
+    }
+    return d
+  }
+
   function makeClusterPlacer() {
     // Cluster near center within a bounded region, unique cell per entity
     const clusterWidth = 1500
@@ -53,6 +87,19 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     const cellW = clusterWidth / cols
     const cellH = clusterHeight / rows
     const used = new Set()
+
+    // TV geometry (avoid spawning inside)
+    const tvX = worldWidth / 2
+    const tvY = worldHeight / 2
+    const tvRadius = 200 // matches 400px TV diameter
+    const tvClearance = 100 // keep circles at least 100px away from TV edge
+
+    function inTv(x, y) {
+      const dx = x - tvX
+      const dy = y - tvY
+      // Exclude any point within the TV radius plus the clearance buffer
+      return (dx * dx + dy * dy) <= Math.pow(tvRadius + tvClearance, 2)
+    }
 
     function findCellIndex(seed) {
       let idx = seed % total
@@ -68,11 +115,28 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
 
     function place(key) {
       const h = hashString(key)
+      let baseIndex = h % total
+      // probe for a free cell that is not inside the TV circle
+      for (let step = 0; step < total; step++) {
+        const probe = (baseIndex + step) % total
+        if (used.has(probe)) continue
+        const cx = probe % cols
+        const cy = Math.floor(probe / cols)
+        const jx = ((Math.floor(h / 997) % 1000) / 1000) * 0.6 + 0.2 // 0.2..0.8
+        const jy = ((Math.floor(h / 787) % 1000) / 1000) * 0.6 + 0.2 // 0.2..0.8
+        const x = left + (cx + jx) * cellW
+        const y = top + (cy + jy) * cellH
+        if (!inTv(x, y)) {
+          used.add(probe)
+          return { x, y }
+        }
+      }
+      // fallback: first free, even if inside (should be rare)
       const index = findCellIndex(h)
       const cx = index % cols
       const cy = Math.floor(index / cols)
-      const jx = ((Math.floor(h / 997) % 1000) / 1000) * 0.6 + 0.2 // 0.2..0.8
-      const jy = ((Math.floor(h / 787) % 1000) / 1000) * 0.6 + 0.2 // 0.2..0.8
+      const jx = ((Math.floor(h / 997) % 1000) / 1000) * 0.6 + 0.2
+      const jy = ((Math.floor(h / 787) % 1000) / 1000) * 0.6 + 0.2
       const x = left + (cx + jx) * cellW
       const y = top + (cy + jy) * cellH
       return { x, y }
@@ -93,6 +157,99 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     panzoomRef.current = instance
     return () => instance.dispose()
   }, [])
+
+  // Draw strong TV static when hovering the TV tile
+  function startTVStatic() {
+    tvHoverRef.current = true
+    setTvHover(true)
+    const canvas = tvCanvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d', { alpha: true })
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      const w = canvas.clientWidth || 1
+      const h = canvas.clientHeight || 1
+      canvas.width = Math.floor(w * dpr)
+      canvas.height = Math.floor(h * dpr)
+      ctx.imageSmoothingEnabled = false
+    }
+    resize()
+    if (tvTimerRef.current) clearInterval(tvTimerRef.current)
+    tvTimerRef.current = setInterval(() => {
+      if (!tvHoverRef.current) return
+      const { width, height } = canvas
+      const img = ctx.createImageData(width, height)
+      const data = img.data
+      for (let i = 0; i < data.length; i += 4) {
+        const v = Math.random() * 255
+        data[i] = v
+        data[i+1] = v
+        data[i+2] = v
+        data[i+3] = 255
+      }
+      ctx.putImageData(img, 0, 0)
+    }, 40) // ~25 FPS
+    const onResize = () => resize()
+    window.addEventListener('resize', onResize)
+    canvas._cleanup = () => {
+      window.removeEventListener('resize', onResize)
+      if (tvTimerRef.current) { clearInterval(tvTimerRef.current); tvTimerRef.current = null }
+    }
+
+    // Start TV hover audio if available and user has interacted (singleton)
+    try {
+      if (!tvAudioRef.current) {
+        const a = new Audio('/tv_hover.mp3')
+        a.loop = true
+        a.volume = 0.45
+        tvAudioRef.current = a
+      }
+      if (tvAudioRef.current.paused) {
+        tvAudioRef.current.currentTime = 0
+        tvAudioRef.current.play().catch(() => {})
+      }
+    } catch {}
+  }
+
+  function stopTVStatic() {
+    tvHoverRef.current = false
+    setTvHover(false)
+    if (tvTimerRef.current) { clearInterval(tvTimerRef.current); tvTimerRef.current = null }
+    const canvas = tvCanvasRef.current
+    if (canvas) {
+      const ctx = canvas.getContext('2d', { alpha: true })
+      // Clear to solid black so screen is dark when not hovered
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      ctx.fillStyle = '#000'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      // Stop TV hover audio singleton
+      if (tvAudioRef.current) { try { tvAudioRef.current.pause() } catch {}; try { tvAudioRef.current.currentTime = 0 } catch {} }
+    }
+  }
+
+  function handleOpenTV() {
+    // Ensure hover static/audio stop before navigating
+    try { stopTVStatic() } catch {}
+    onOpenTV?.()
+  }
+
+  // Stop the legacy hover sound
+  function stopHoverAudio() {
+    hoverCountRef.current = 0
+    const a = hoverAudioRef.current
+    if (a) { try { a.pause() } catch {}; try { a.currentTime = 0 } catch {} }
+  }
+
+  // Composite handlers for TV-connected circle hover
+  function handleInTvEnter() {
+    stopHoverAudio()
+    startTVStatic()
+  }
+
+  function handleInTvLeave() {
+    stopHoverAudio()
+    stopTVStatic()
+  }
 
   // Shared hover audio (loops while hovering any circle)
   useEffect(() => {
@@ -254,7 +411,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
   return (
     <div className="w-full h-full relative">
       <StaticBackground opacity={0.06} fps={20} />
-      {/* Title removed per request */}
+      {/* TV button is rendered inside the world (pans/zooms) */}
       <div
         ref={viewportRef}
         className="fixed inset-0 overflow-hidden z-[1]"
@@ -264,10 +421,52 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
           className="relative touch-pan-y touch-pan-x select-none"
           style={{ width: worldWidth + 'px', height: worldHeight + 'px' }}
         >
+            {/* Umbilical cords from TV to users currently on TV (rendered before TV to sit behind) */}
+            <svg className="absolute inset-0 pointer-events-none" width={worldWidth} height={worldHeight} viewBox={`0 0 ${worldWidth} ${worldHeight}`}
+              style={{ left: 0, top: 0 }}>
+              {tvIds.map((uid) => {
+                const p = makeClusterPlacer()
+                const u = users.find(x => x.id === uid)
+                if (!u || uid === selfId) return null
+                const pos = p(u.id)
+                const tvX = worldWidth/2
+                const tvY = worldHeight/2
+                const d = buildWavePath(tvX, tvY, pos.x, pos.y)
+                return (
+                  <path key={`cord-${uid}`} d={d} fill="none" stroke={tvHover ? "url(#cordStatic)" : "#000"} strokeWidth="8" strokeLinecap="round" opacity={tvHover ? 1 : 0.9} vectorEffect="non-scaling-stroke" shapeRendering="geometricPrecision" />
+                )
+              })}
+              <defs>
+                <filter id="noiseFilter">
+                  <feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="2" stitchTiles="stitch" />
+                </filter>
+                <pattern id="cordStatic" patternUnits="userSpaceOnUse" width="20" height="20">
+                  <rect width="20" height="20" filter="url(#noiseFilter)"/>
+                </pattern>
+              </defs>
+            </svg>
+
+            {/* Center-ish TV tile, stable position */}
+            <button
+              onClick={handleOpenTV}
+              className="absolute -translate-x-1/2 -translate-y-1/2 group hover:scale-[1.02] transition"
+              style={{ left: (worldWidth/2) + 'px', top: (worldHeight/2) + 'px', width: '400px', height: '400px' }}
+              aria-label="Open TV"
+              title="Open TV"
+              onMouseEnter={startTVStatic}
+              onMouseLeave={stopTVStatic}
+            >
+              <div className="relative w-full h-full">
+                <div className="absolute inset-0 rounded-full bg-black overflow-hidden shadow">
+                  <canvas ref={tvCanvasRef} className="w-full h-full block" />
+                </div>
+              </div>
+            </button>
             {(() => {
               const place = makeClusterPlacer()
               return (
                 <>
+                  {/* (Removed flat cords; using SVG wave above) */}
                   {pairs.map(({ a, b }) => {
                     const key = [a, b].sort().join('|')
                     const { color, lightness } = hashToGray(key)
@@ -295,16 +494,17 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                     const pos = place(u.id)
                     const t = timesMemo.single.get(u.id) || 0
                     const textColor = grayTextFor(lightness)
+                    const inTV = tvIds.includes(u.id)
                     return (
                       <button
                         key={u.id}
                         onClick={() => onRequestChat(u.id)}
                         className="absolute -translate-x-1/2 -translate-y-1/2 w-16 h-16 rounded-full shadow hover:scale-105 transition"
                         style={{ left: `${pos.x}px`, top: `${pos.y}px`, backgroundColor: color, boxShadow: `0 0 12px ${color}` }}
-                        title="Start chat"
-                        aria-label="Start chat"
-                        onMouseEnter={onHoverStart}
-                        onMouseLeave={onHoverEnd}
+                        title={inTV ? 'TV connected' : 'Start chat'}
+                        aria-label={inTV ? 'TV connected' : 'Start chat'}
+                        onMouseEnter={inTV ? handleInTvEnter : onHoverStart}
+                        onMouseLeave={inTV ? handleInTvLeave : onHoverEnd}
                       >
                         <img src="/circle.gif" alt="" className="absolute inset-0 w-full h-full object-cover rounded-full pointer-events-none" style={{ opacity: 0.25 }} />
                         <div className="w-full h-full grid place-items-center text-[10px] font-mono" style={{ color: textColor }}>{msToHMS(t)}</div>

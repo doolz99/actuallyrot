@@ -1,0 +1,235 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import TVFloatChat from './TVFloatChat.jsx'
+
+export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
+  const [dnd, setDnd] = useState(false)
+  const [apiReady, setApiReady] = useState(false)
+  const [room, setRoom] = useState(null) // { videoId, baseIndex, baseTs, playbackRate, isPlaying }
+  const playerRef = useRef(null)
+  const [isMuted, setIsMuted] = useState(true)
+  const PLAYLIST_ID = 'PLqI4z8Cwl_TD1siZWi93dzjs1p_r2MPP9'
+  const [chatOverlap, setChatOverlap] = useState(0)
+  const [scale, setScale] = useState(1)
+
+  // Load YouTube IFrame API once
+  useEffect(() => {
+    if (window.YT && window.YT.Player) { setApiReady(true); return }
+    const s = document.createElement('script')
+    s.src = 'https://www.youtube.com/iframe_api'
+    s.async = true
+    document.head.appendChild(s)
+    const onReady = () => setApiReady(true)
+    window.onYouTubeIframeAPIReady = onReady
+    return () => { try { if (window.onYouTubeIframeAPIReady === onReady) window.onYouTubeIframeAPIReady = null } catch {} }
+  }, [])
+
+  // Load timesync client if missing
+  useEffect(() => {
+    if (window.timesync?.create) return
+    const s = document.createElement('script')
+    s.src = 'https://unpkg.com/timesync/dist/timesync.min.js'
+    s.async = true
+    document.head.appendChild(s)
+    return () => {}
+  }, [])
+
+  // Compute chat overlap so page doesn't scroll; scale to fill width
+  useEffect(() => {
+    function recalc() {
+      const baseW = 1280
+      const baseVideoH = 720
+      const baseChatH = 220
+      const margin = 8
+      const sw = (window.innerWidth || baseW) / baseW
+      const sh = (window.innerHeight || (baseVideoH + margin + baseChatH)) / (baseVideoH + margin + baseChatH)
+      const nextScale = Math.min(sw, sh) // scale up or down to fit both width and height
+      const totalScaled = (baseVideoH + margin + baseChatH) * nextScale
+      const avail = window.innerHeight || totalScaled
+      const overScaled = Math.max(0, totalScaled - avail)
+      setScale(nextScale)
+      // Convert scaled overlap back to unscaled px so our marginTop compensation works pre-scale
+      setChatOverlap(overScaled / (nextScale || 1))
+    }
+    recalc()
+    window.addEventListener('resize', recalc)
+    return () => window.removeEventListener('resize', recalc)
+  }, [])
+
+  // timesync offset
+  const [offsetMs, setOffsetMs] = useState(0)
+  useEffect(() => {
+    let ts = null
+    try { ts = window.timesync?.create?.({ server: '/timesync', interval: 10000 }) } catch {}
+    if (!ts) return
+    const update = () => { try { setOffsetMs(ts.now() - Date.now()) } catch {} }
+    ts.on('sync', update)
+    update()
+    return () => { try { ts.off('sync', update) } catch {} }
+  }, [])
+
+  const serverNow = useMemo(() => (clientBaseTs) => {
+    const now = Date.now() + offsetMs
+    if (!clientBaseTs) return 0
+    const delta = Math.max(0, now - clientBaseTs)
+    return delta / 1000
+  }, [offsetMs])
+  useEffect(() => {
+    try { onEnterTV?.() } catch {}
+    return () => { try { onLeaveTV?.() } catch {} }
+  }, [onEnterTV, onLeaveTV])
+  useEffect(() => {
+    try { onSetDnd?.(dnd) } catch {}
+  }, [dnd, onSetDnd])
+
+  // Socket wiring for room timeline
+  useEffect(() => {
+    if (!socket) return
+    const onRoom = (s) => setRoom(s)
+    socket.emit('join_room', { roomId: 'tv' })
+    socket.on('tv_room_state', onRoom)
+    socket.emit('tv_request_state')
+    const reqTimer = setInterval(() => { try { socket.emit('tv_request_state') } catch {} }, 15000)
+    return () => {
+      socket.off('tv_room_state', onRoom)
+      socket.emit('leave_room', { roomId: 'tv' })
+      clearInterval(reqTimer)
+    }
+  }, [socket])
+
+  // Initialize player once API ready
+  useEffect(() => {
+    if (!apiReady || playerRef.current) return
+    playerRef.current = new window.YT.Player('tv-player', {
+      width: '1280', height: '720',
+      host: 'https://www.youtube-nocookie.com',
+      playerVars: { controls: 0, fs: 0, disablekb: 1, modestbranding: 1, rel: 0, iv_load_policy: 3, playsinline: 1, autoplay: 1, origin: window.location.origin },
+      events: { onReady, onStateChange, onError }
+    })
+  }, [apiReady])
+
+  function onReady() {
+    try {
+      const p = playerRef.current
+      p.mute(); setIsMuted(true)
+      // Bootstrap: if server has no playlist order yet, we provide it by cueing playlist shuffled
+      if (!room || !room.videoId) {
+        // Seed playlist order: shuffle + load playlist
+        try { p.setShuffle(true) } catch {}
+        try { p.loadPlaylist({ listType: 'playlist', list: PLAYLIST_ID, index: 0, startSeconds: 0 }) } catch {}
+        setTimeout(() => { try { p.playVideo() } catch {} }, 100)
+        setTimeout(() => {
+          try {
+            const order = p.getPlaylist?.() || []
+            if (Array.isArray(order) && order.length) socket?.emit('tv_playlist', { order })
+          } catch {}
+        }, 1500)
+      }
+    } catch {}
+  }
+
+  function onStateChange(ev) {
+    const p = playerRef.current
+    if (!p) return
+    try {
+      if (ev.data === window.YT.PlayerState.PLAYING) {
+        const vid = p.getVideoData()?.video_id
+        const dur = Number(p.getDuration?.())
+        if (vid && isFinite(dur) && dur > 0) socket?.emit('tv_duration', { videoId: vid, duration: dur })
+        // Ask for fresh state to align
+        socket?.emit('tv_request_state')
+      } else if (ev.data === window.YT.PlayerState.ENDED) {
+        const vid = p.getVideoData()?.video_id
+        socket?.emit('tv_ended', { videoId: vid })
+      }
+    } catch {}
+  }
+  function onError() {
+    try {
+      const vid = playerRef.current?.getVideoData?.()?.video_id
+      if (vid) socket?.emit('tv_ended', { videoId: vid })
+    } catch {}
+  }
+
+  // Apply server state to player (followers)
+  useEffect(() => {
+    const p = playerRef.current
+    const s = room
+    if (!p || !s || !s.videoId) return
+    try {
+      const cur = p.getVideoData()?.video_id
+      if (cur !== s.videoId) {
+        p.loadVideoById(s.videoId)
+      }
+      const target = serverNow(s.baseTs)
+      const now = p.getCurrentTime()
+      if (Math.abs(target - now) > 0.25) p.seekTo(target, true)
+      if (s.isPlaying) p.playVideo(); else p.pauseVideo()
+      if (p.getPlaybackRate() !== s.playbackRate) p.setPlaybackRate(s.playbackRate)
+    } catch {}
+  }, [room, serverNow])
+
+  // Continuous drift correction and state enforcement (tight loop)
+  useEffect(() => {
+    const p = playerRef.current
+    if (!p || !room) return
+    const tick = () => {
+      try {
+        const cur = p.getVideoData()?.video_id
+        if (cur !== room.videoId) {
+          p.loadVideoById(room.videoId)
+          setTimeout(() => { try {
+            const target = serverNow(room.baseTs)
+            p.seekTo(target, true)
+            if (room.isPlaying) p.playVideo(); else p.pauseVideo()
+          } catch {} }, 50)
+          return
+        }
+        const target = serverNow(room.baseTs)
+        const now = p.getCurrentTime()
+        if (Math.abs(target - now) > 0.15) p.seekTo(target, true)
+        const want = room.isPlaying
+        const st = p.getPlayerState?.()
+        const isPlaying = st === window.YT.PlayerState.PLAYING || st === window.YT.PlayerState.BUFFERING
+        if (want && !isPlaying) p.playVideo()
+        if (!want && isPlaying) p.pauseVideo()
+        if (p.getPlaybackRate?.() !== room.playbackRate) p.setPlaybackRate(room.playbackRate)
+      } catch {}
+    }
+    const t = setInterval(tick, 250)
+    tick()
+    return () => clearInterval(t)
+  }, [room, serverNow])
+
+  return (
+    <div className="w-full h-full bg-black text-white relative">
+      <button
+        className="absolute top-3 left-3 z-50 text-xs text-zinc-400 hover:text-white"
+        onClick={onExit}
+      >Back</button>
+      <button
+        className="absolute bottom-3 left-3 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
+        onClick={() => setDnd(v => !v)}
+      >{dnd ? 'DND: ON (no chats)' : 'DND: OFF (allow chats)'}</button>
+      <div className="w-full h-full flex flex-col items-center" style={{ transform: `scale(${scale})`, transformOrigin: 'top center' }}>
+        <div className="relative" style={{ width: '1280px', height: '720px' }}>
+          <div id="tv-player" className="w-[1280px] h-[720px] bg-black" />
+          {/* Click blocker to keep visual-only */}
+          <div className="absolute inset-0 z-20" style={{ pointerEvents: 'auto' }} />
+          {/* Enable sound button */}
+          {isMuted && (
+            <button
+              className="absolute bottom-3 right-3 z-30 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
+              onClick={() => { try { playerRef.current?.unMute?.(); setIsMuted(false) } catch {} }}
+            >Enable sound</button>
+          )}
+        </div>
+        {/* Transient float chat below, background fully transparent */}
+        <div style={{ marginTop: Math.max(0, 8 - chatOverlap) + 'px' }}>
+          <TVFloatChat socket={socket} width={1280} height={220} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+

@@ -101,8 +101,7 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
     if (!apiReady || playerRef.current) return
     playerRef.current = new window.YT.Player('tv-player', {
       width: '1280', height: '720',
-      host: 'https://www.youtube-nocookie.com',
-      playerVars: { controls: 0, fs: 0, disablekb: 1, modestbranding: 1, rel: 0, iv_load_policy: 3, playsinline: 1, autoplay: 1, origin: window.location.origin },
+      playerVars: { controls: 0, fs: 0, disablekb: 1, modestbranding: 1, rel: 0, iv_load_policy: 3, playsinline: 1, autoplay: 1 },
       events: { onReady, onStateChange, onError }
     })
   }, [apiReady])
@@ -115,7 +114,7 @@ export default function TV({ socket, onExit, onEnterTV, onLeaveTV, onSetDnd }) {
       if (!room || !room.videoId) {
         // Seed playlist order: shuffle + load playlist
         try { p.setShuffle(true) } catch {}
-        try { p.loadPlaylist({ listType: 'playlist', list: PLAYLIST_ID, index: 0, startSeconds: 0 }) } catch {}
+        try { p.cuePlaylist({ list: PLAYLIST_ID }) } catch {}
         setTimeout(() => { try { p.playVideo() } catch {} }, 100)
         setTimeout(() => {
           try {

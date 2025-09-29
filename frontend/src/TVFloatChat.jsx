@@ -19,7 +19,7 @@ function hashString(str) {
   return h >>> 0
 }
 
-export default function TVFloatChat({ socket, width = 1280, height = 260, adminIds = [] }) {
+export default function TVFloatChat({ socket, width = 1280, height = 260, adminIds = [], disableRefocus = false }) {
   const [messages, setMessages] = useState([]) // {id, text, ts}
   const [draft, setDraft] = useState('')
   const [seed, setSeed] = useState(() => Math.floor(Math.random()*1e9) >>> 0)
@@ -32,6 +32,7 @@ export default function TVFloatChat({ socket, width = 1280, height = 260, adminI
   useEffect(() => {
     if (!socket) return
     const onMsg = (m) => {
+      try { playTvSendSound() } catch {}
       // TTL scales with message length
       const chars = (m.text || '').length
       const ttl = Math.max(4, Math.min(12, 2 + 0.12 * chars))
@@ -184,7 +185,6 @@ export default function TVFloatChat({ socket, width = 1280, height = 260, adminI
     socket?.emit('tv_message', { text: t, seed })
     setDraft('')
     setSeed((seed + 1) >>> 0)
-    try { playTvSendSound() } catch {}
   }
 
   // hidden input capture
@@ -198,10 +198,11 @@ export default function TVFloatChat({ socket, width = 1280, height = 260, adminI
   }, [])
   // Global click-to-refocus (captures events even if overlays eat them)
   useEffect(() => {
+    if (disableRefocus) return
     const refocus = () => { setTimeout(() => { try { inputRef.current?.focus?.() } catch {} }, 0) }
     window.addEventListener('pointerdown', refocus, true)
     return () => window.removeEventListener('pointerdown', refocus, true)
-  }, [])
+  }, [disableRefocus])
   // Immediate local echo of my preview; throttle network emits to ~10/s
   useEffect(() => {
     // Local optimistic update

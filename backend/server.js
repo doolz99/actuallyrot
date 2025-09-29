@@ -58,6 +58,8 @@ let tvBaseTs = 0;
 // Playback properties
 let tvPlaybackRate = 1;
 let tvPaused = false;
+// Admin queue of explicit next videos (videoIds). When non-empty, these take precedence.
+let tvQueue = [];
 
 // --- Device time tracking ---
 // deviceId -> { totalMs: number, lastCountedSec?: number, lastBeatMs?: number }
@@ -353,13 +355,54 @@ io.on('connection', (socket) => {
   // A client detected that current video ended (safety advance)
   socket.on('tv_ended', ({ videoId }) => {
     try {
-      if (!tvPlaylistOrder || tvPlaylistOrder.length === 0) return;
-      const currentId = tvPlaylistOrder[tvBaseIndex];
-      if (videoId && videoId !== currentId) return;
-      tvBaseIndex = (tvBaseIndex + 1) % tvPlaylistOrder.length;
-      tvBaseTs = Date.now();
+      advanceTv(Date.now());
+    } catch {}
+  });
+
+  // ---- Admin TV controls ----
+  socket.on('tv_admin_set_video', ({ videoId }) => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      const vid = normalizeVideoId(videoId);
+      if (!vid) return;
+      setCurrentVideo(vid, Date.now());
       const state = computeTvRoomState();
       if (state) io.to('tv').emit('tv_room_state', state);
+    } catch {}
+  });
+
+  socket.on('tv_admin_skip', () => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      advanceTv(Date.now());
+      const state = computeTvRoomState();
+      if (state) io.to('tv').emit('tv_room_state', state);
+    } catch {}
+  });
+
+  socket.on('tv_admin_queue', ({ videoIds }) => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      const list = Array.isArray(videoIds) ? videoIds : [];
+      for (const raw of list) {
+        const vid = normalizeVideoId(raw);
+        if (!vid) continue;
+        if (!tvQueue.includes(vid)) tvQueue.push(vid);
+      }
+    } catch {}
+  });
+
+  socket.on('tv_admin_clear_queue', () => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      tvQueue = [];
+      // Switch immediately back to default next item
+      if (tvPlaylistOrder && tvPlaylistOrder.length > 0) {
+        tvBaseIndex = (tvBaseIndex + 1) % tvPlaylistOrder.length;
+        tvBaseTs = Date.now();
+        const state = computeTvRoomState();
+        if (state) io.to('tv').emit('tv_room_state', state);
+      }
     } catch {}
   });
 
@@ -530,6 +573,45 @@ function computeTvRoomState() {
   } catch {
     return null;
   }
+}
+
+// Helpers for admin controls and end-of-video advance
+function normalizeVideoId(input) {
+  try {
+    if (!input || typeof input !== 'string') return null;
+    const m = input.match(/[a-zA-Z0-9_-]{11}/);
+    return m ? m[0] : null;
+  } catch { return null }
+}
+
+function setCurrentVideo(videoId, nowMs) {
+  try {
+    if (!tvPlaylistOrder) tvPlaylistOrder = [];
+    const idx = tvPlaylistOrder.indexOf(videoId);
+    if (idx === -1) {
+      // Prepend and keep unique
+      tvPlaylistOrder = [videoId, ...tvPlaylistOrder.filter(v => v !== videoId)];
+      tvBaseIndex = 0;
+    } else {
+      tvBaseIndex = idx;
+    }
+    tvBaseTs = nowMs;
+    tvPaused = false;
+  } catch {}
+}
+
+function advanceTv(nowMs) {
+  try {
+    // If queue has items, play from queue first
+    if (tvQueue && tvQueue.length > 0) {
+      const next = tvQueue.shift();
+      setCurrentVideo(next, nowMs);
+      return;
+    }
+    if (!tvPlaylistOrder || tvPlaylistOrder.length === 0) return;
+    tvBaseIndex = (tvBaseIndex + 1) % tvPlaylistOrder.length;
+    tvBaseTs = nowMs;
+  } catch {}
 }
 
 server.listen(PORT, () => {

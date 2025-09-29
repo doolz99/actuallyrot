@@ -7,6 +7,9 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
   const [room, setRoom] = useState(null) // { videoId, baseIndex, baseTs, playbackRate, isPlaying }
   const playerRef = useRef(null)
   const [isMuted, setIsMuted] = useState(true)
+  const [volume, setVolume] = useState(() => {
+    try { const v = Number(localStorage.getItem('tv_volume')); return isFinite(v) ? Math.max(0, Math.min(100, v)) : 100 } catch { return 100 }
+  })
   const PLAYLIST_ID = 'PLqI4z8Cwl_TD1siZWi93dzjs1p_r2MPP9'
   const [videoSize, setVideoSize] = useState({ width: 1280, height: 720, left: 0, top: 0 })
   const [flash, setFlash] = useState(false)
@@ -21,6 +24,10 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
   const bootStartRef = useRef(Date.now())
   const lastStateRef = useRef(Date.now())
   const [stalled, setStalled] = useState(false)
+  const [adminUrl, setAdminUrl] = useState('')
+  const [adminOpen, setAdminOpen] = useState(false)
+  const helperRef = useRef(null)
+  const [queueBusy, setQueueBusy] = useState(false)
 
   // Load YouTube IFrame API once
   useEffect(() => {
@@ -175,6 +182,48 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
         }
       }
       step()
+    })
+  }
+
+  function parsePlaylistId(urlOrId) {
+    try {
+      if (!urlOrId) return ''
+      const s = String(urlOrId)
+      const m1 = s.match(/[?&]list=([a-zA-Z0-9_-]+)/)
+      if (m1) return m1[1]
+      if (/^[a-zA-Z0-9_-]+$/.test(s)) return s
+      return ''
+    } catch { return '' }
+  }
+
+  async function fetchPlaylistOrder(playlistId) {
+    return new Promise(resolve => {
+      try {
+        const container = document.getElementById('tv-helper')
+        if (!container || !window.YT || !window.YT.Player) return resolve([])
+        const helperId = 'yt_helper_' + Math.random().toString(36).slice(2)
+        const div = document.createElement('div')
+        div.id = helperId
+        container.appendChild(div)
+        const helper = new window.YT.Player(helperId, {
+          width: '0', height: '0',
+          playerVars: { playsinline: 1 },
+          events: {
+            onReady: () => {
+              try { helper.setShuffle(true) } catch {}
+              try { helper.cuePlaylist({ list: playlistId }) } catch {}
+              setTimeout(() => {
+                try {
+                  const ids = helper.getPlaylist?.() || []
+                  resolve(Array.isArray(ids) ? ids : [])
+                } catch { resolve([]) }
+                try { helper.destroy?.() } catch {}
+                try { container.removeChild(div) } catch {}
+              }, 1500)
+            }
+          }
+        })
+      } catch { resolve([]) }
     })
   }
 
@@ -430,6 +479,9 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
           onClick={onExit}
         >Back</button>
       )}
+      {/* Admin inline controls removed in favor of slide-out panel */}
+      {/* Hidden helper container for playlist introspection */}
+      <div id="tv-helper" style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }} />
       {!capturing && adminIds.includes(socket?.id) && !captureReady && (
         <button
           className="tv-ui absolute top-3 right-3 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
@@ -444,6 +496,52 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
       {captureWarn && (
         <div className="tv-ui absolute top-8 right-3 z-50 text-[10px] px-2 py-1 rounded bg-yellow-600/30 border border-yellow-400/60">
           No frames yet
+        </div>
+      )}
+      {/* Admin panel toggle */}
+      {!capturing && adminIds.includes(socket?.id) && (
+        <button
+          className="tv-ui absolute top-3 right-24 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
+          onClick={() => setAdminOpen(v => !v)}
+        >{adminOpen ? 'Close' : 'Admin'}</button>
+      )}
+      {/* Slide-out admin panel */}
+      {adminIds.includes(socket?.id) && (
+        <div className={`tv-ui fixed top-0 right-0 h-full w-80 z-50 bg-black/80 border-l border-white/15 transition-transform duration-200 ${adminOpen ? 'translate-x-0' : 'translate-x-full'}`}
+             onKeyDown={(e) => { if (e.key === 'Escape') setAdminOpen(false) }}>
+          <div className="p-3 space-y-2 text-[11px] relative">
+            <button
+              className="absolute top-2 right-2 px-2 py-1 rounded bg-white/10 hover:bg-white/20"
+              onClick={() => setAdminOpen(false)}
+              aria-label="Close admin panel"
+            >×</button>
+            <div className="font-mono text-zinc-300">YouTube controls</div>
+            <input autoFocus={adminOpen} value={adminUrl} onChange={e => setAdminUrl(e.target.value)} placeholder="YouTube URL or ID"
+              className="w-full px-2 py-1 rounded bg-white/10 border border-white/20 outline-none" />
+            <div className="flex gap-2">
+              <button className="px-2 py-1 rounded bg-white/10 hover:bg-white/20" onClick={() => {
+                try {
+                  const idMatch = String(adminUrl||'').match(/[a-zA-Z0-9_-]{11}/)
+                  const vid = idMatch ? idMatch[0] : ''
+                  if (vid) socket?.emit('tv_admin_set_video', { videoId: vid })
+                } catch {}
+              }}>Set video</button>
+              <button className="px-2 py-1 rounded bg-white/10 hover:bg-white/20" onClick={() => { try { socket?.emit('tv_admin_skip') } catch {} }}>Skip</button>
+            </div>
+            <div className="flex gap-2">
+              <button disabled={queueBusy} className="px-2 py-1 rounded bg-white/10 hover:bg-white/20 disabled:opacity-50" onClick={async () => {
+                try {
+                  const pl = parsePlaylistId(adminUrl)
+                  if (!pl) return
+                  setQueueBusy(true)
+                  const ids = await fetchPlaylistOrder(pl)
+                  if (ids && ids.length) socket?.emit('tv_admin_queue', { videoIds: ids })
+                } catch {} finally { setQueueBusy(false) }
+              }}>Queue playlist</button>
+              <button className="px-2 py-1 rounded bg-white/10 hover:bg-white/20" onClick={() => { try { socket?.emit('tv_admin_clear_queue') } catch {} }}>Clear queue</button>
+            </div>
+            <div className="text-xs text-zinc-400">Esc closes panel</div>
+          </div>
         </div>
       )}
       {!capturing && (
@@ -469,7 +567,7 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
                   const p = playerRef.current
                   if (!p) return
                   p.unMute?.()
-                  p.setVolume?.(100)
+                  p.setVolume?.(volume)
                   // some browsers require a play() call after unmuting
                   try { p.playVideo?.() } catch {}
                   setIsMuted(false)
@@ -477,10 +575,28 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
               }}
             >Enable sound</button>
           )}
+          {!capturing && !isMuted && (
+            <div className="tv-ui absolute bottom-3 right-3 z-30 flex items-center gap-2 px-2 py-1 rounded bg-white/10 backdrop-blur text-white text-xs">
+              <span>Vol</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={volume}
+                onChange={(e) => {
+                  const v = Number(e.target.value)
+                  setVolume(v)
+                  try { localStorage.setItem('tv_volume', String(v)) } catch {}
+                  try { playerRef.current?.setVolume?.(v) } catch {}
+                }}
+              />
+            </div>
+          )}
           {/* Transient float chat overlay matching video area */}
           {!capturing && (
             <div className="tv-ui absolute inset-0 z-30" style={{ pointerEvents: 'none' }}>
-              <TVFloatChat socket={socket} adminIds={adminIds} width={videoSize.width} height={videoSize.height} />
+              <TVFloatChat socket={socket} adminIds={adminIds} width={videoSize.width} height={videoSize.height} disableRefocus={adminOpen} />
             </div>
           )}
         </div>

@@ -6,10 +6,25 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
   const [apiReady, setApiReady] = useState(false)
   const [room, setRoom] = useState(null) // { videoId, baseIndex, baseTs, playbackRate, isPlaying }
   const playerRef = useRef(null)
+  const webrtcVideoRef = useRef(null)
+  // WebRTC endpoint from env or ?whep=
+  const WHEP_URL = useMemo(() => {
+    try {
+      const env = import.meta.env.VITE_WHEP_URL
+      if (env) return String(env)
+      const sp = new URLSearchParams(window.location.search)
+      const q = sp.get('whep') || sp.get('webrtc')
+      return q ? String(q) : ''
+    } catch { return '' }
+  }, [])
+  const isWebRtcMode = !!WHEP_URL
+  const [useWebRtc, setUseWebRtc] = useState(!!WHEP_URL)
   const [isMuted, setIsMuted] = useState(true)
   const [volume, setVolume] = useState(() => {
     try { const v = Number(localStorage.getItem('tv_volume')); return isFinite(v) ? Math.max(0, Math.min(100, v)) : 100 } catch { return 100 }
   })
+  const whepPcRef = useRef(null)
+  const [whepActive, setWhepActive] = useState(false)
   const PLAYLIST_ID = 'PLqI4z8Cwl_TD1siZWi93dzjs1p_r2MPP9'
   const [videoSize, setVideoSize] = useState({ width: 1280, height: 720, left: 0, top: 0 })
   const [flash, setFlash] = useState(false)
@@ -28,9 +43,15 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
   const [adminOpen, setAdminOpen] = useState(false)
   const helperRef = useRef(null)
   const [queueBusy, setQueueBusy] = useState(false)
+  const [viewCounts, setViewCounts] = useState({ watching: 0, altTabbed: 0 })
+  const [uiHidden, setUiHidden] = useState(false)
+  const [liveDesired, setLiveDesired] = useState(!!import.meta.env.VITE_WHEP_URL)
 
-  // Load YouTube IFrame API once
+  // Keep both layers mounted; we toggle visibility to avoid DOM race conditions
+
+  // Load YouTube IFrame API once (skip while using WebRTC)
   useEffect(() => {
+    if (useWebRtc) return
     if (window.YT && window.YT.Player) { setApiReady(true); return }
     const s = document.createElement('script')
     s.src = 'https://www.youtube.com/iframe_api'
@@ -39,7 +60,7 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     const onReady = () => setApiReady(true)
     window.onYouTubeIframeAPIReady = onReady
     return () => { try { if (window.onYouTubeIframeAPIReady === onReady) window.onYouTubeIframeAPIReady = null } catch {} }
-  }, [])
+  }, [useWebRtc])
 
   // Load timesync client if missing
   useEffect(() => {
@@ -72,9 +93,133 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     return () => window.removeEventListener('resize', recalc)
   }, [])
 
-  // Paparazzi flash on Right Alt
+  // WebRTC WHEP subscribe (viewer) when enabled
+  useEffect(() => {
+    if (!useWebRtc) return
+    if (whepPcRef.current) { setWhepActive(true); return () => {} }
+    let closed = false
+    async function start() {
+      try {
+        const video = webrtcVideoRef.current
+        if (!video) return
+        const ice = []
+        try {
+          const turl = import.meta.env.VITE_TURN_URL
+          const tuser = import.meta.env.VITE_TURN_USER
+          const tpass = import.meta.env.VITE_TURN_PASS
+          if (turl && tuser && tpass) ice.push({ urls: [turl], username: tuser, credential: tpass })
+        } catch {}
+        const pc = new RTCPeerConnection({ iceServers: ice })
+        whepPcRef.current = pc
+        pc.addTransceiver('video', { direction: 'recvonly' })
+        pc.addTransceiver('audio', { direction: 'recvonly' })
+        pc.ontrack = (ev) => {
+          if (closed) return
+          try { video.srcObject = ev.streams[0] } catch {}
+          try { video.play().catch(() => {}) } catch {}
+          try { const vs = ev.streams?.[0]; const [track] = vs?.getVideoTracks?.() || []; if (track) track.onended = () => { setUseWebRtc(false) } } catch {}
+        }
+        pc.onconnectionstatechange = () => {
+          const st = pc.connectionState
+          if (st === 'failed' || st === 'disconnected' || st === 'closed') {
+            setUseWebRtc(false)
+          }
+        }
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        const res = await fetch(WHEP_URL, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: offer.sdp })
+        if (!res.ok) throw new Error('WHEP failed ' + res.status)
+        const sdp = await res.text()
+        await pc.setRemoteDescription({ type: 'answer', sdp })
+        setWhepActive(true)
+      } catch {
+        setWhepActive(false)
+        setUseWebRtc(false)
+      }
+    }
+    start()
+    return () => {
+      closed = true
+      try { whepPcRef.current?.close?.() } catch {}
+      setWhepActive(false)
+    }
+  }, [useWebRtc, WHEP_URL])
+
+  // Cleanup PC when disabling WebRTC
+  useEffect(() => {
+    if (!useWebRtc && whepPcRef.current) {
+      try { whepPcRef.current.close() } catch {}
+      whepPcRef.current = null
+      setWhepActive(false)
+    }
+  }, [useWebRtc])
+
+  // Auto-retry without flicker: probe WHEP in background and switch only after tracks arrive
+  useEffect(() => {
+    if (!isWebRtcMode) return
+    if (useWebRtc) return
+    let cancelled = false
+    let timer = 0
+    async function probeOnce() {
+      if (cancelled) return
+      if (whepPcRef.current) return
+      try {
+        const video = webrtcVideoRef.current
+        if (!video) return
+        const ice = []
+        try {
+          const turl = import.meta.env.VITE_TURN_URL
+          const tuser = import.meta.env.VITE_TURN_USER
+          const tpass = import.meta.env.VITE_TURN_PASS
+          if (turl && tuser && tpass) ice.push({ urls: [turl], username: tuser, credential: tpass })
+        } catch {}
+        const pc = new RTCPeerConnection({ iceServers: ice })
+        let gotTrack = false
+        whepPcRef.current = pc
+        pc.addTransceiver('video', { direction: 'recvonly' })
+        pc.addTransceiver('audio', { direction: 'recvonly' })
+        pc.ontrack = (ev) => {
+          if (cancelled) return
+          gotTrack = true
+          try { video.srcObject = ev.streams[0] } catch {}
+          try { video.play().catch(() => {}) } catch {}
+          setWhepActive(true)
+          setUseWebRtc(true)
+        }
+        pc.onconnectionstatechange = () => {
+          const st = pc.connectionState
+          if ((st === 'failed' || st === 'disconnected' || st === 'closed') && !gotTrack) {
+            try { pc.close() } catch {}
+            if (whepPcRef.current === pc) whepPcRef.current = null
+          }
+        }
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        const res = await fetch(WHEP_URL, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: offer.sdp })
+        if (!res.ok) throw new Error('probe failed ' + res.status)
+        const sdp = await res.text()
+        await pc.setRemoteDescription({ type: 'answer', sdp })
+      } catch {
+        // ignore; will retry
+      }
+    }
+    function loop() {
+      if (cancelled) return
+      probeOnce()
+      timer = window.setTimeout(loop, 8000)
+    }
+    loop()
+    return () => { cancelled = true; try { clearTimeout(timer) } catch {} }
+  }, [useWebRtc, isWebRtcMode, WHEP_URL])
+
+  // Paparazzi flash on Right Alt and UI toggle Ctrl+H
   useEffect(() => {
     async function onKey(e) {
+      if (e.ctrlKey && (e.key === 'h' || e.key === 'H')) {
+        e.preventDefault()
+        setUiHidden(v => !v)
+        return
+      }
       if (e.code === 'AltRight') {
         e.preventDefault()
         try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
@@ -271,9 +416,10 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
   }
 
 
-  // Receive flash events from others
+  // Receive server events
   useEffect(() => {
     if (!socket) return
+    const onLive = ({ on }) => { try { const flag = !!on; setLiveDesired(flag); setUseWebRtc(flag); } catch {} }
     const onFlash = () => {
       try { if (flashTimerRef.current) clearTimeout(flashTimerRef.current) } catch {}
       setFlash(true)
@@ -281,9 +427,36 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
       flashTimerRef.current = setTimeout(() => setFlash(false), 120)
     }
     socket.on('tv_flash', onFlash)
+    socket.on('tv_live', onLive)
+    const lastNonZero = { current: { w: 0, a: 0 } }
+    const onCounts = (c) => {
+      try {
+        const w = Number(c?.watching) || 0
+        const a = Number(c?.altTabbed) || 0
+        if (w === 0 && a === 0 && (lastNonZero.current.w + lastNonZero.current.a) > 0) {
+          // ignore single zero tick
+          return
+        }
+        if (w + a > 0) lastNonZero.current = { w, a }
+        setViewCounts({ watching: w, altTabbed: a })
+      } catch {}
+    }
+    socket.on('tv_view_counts', onCounts)
     // ensure we're in the tv room to receive
     try { socket.emit('join_room', { roomId: 'tv' }) } catch {}
-    return () => { socket.off('tv_flash', onFlash); try { socket.emit('leave_room', { roomId: 'tv' }) } catch {} }
+    return () => { socket.off('tv_flash', onFlash); socket.off('tv_view_counts', onCounts); socket.off('tv_live', onLive); try { socket.emit('leave_room', { roomId: 'tv' }) } catch {} }
+  }, [socket])
+
+  // Re-join TV room and restate TV presence on reconnect to reduce flicker
+  useEffect(() => {
+    if (!socket) return
+    const onConn = () => {
+      try { socket.emit('join_room', { roomId: 'tv' }) } catch {}
+      try { socket.emit('tv_state', { inTv: true }) } catch {}
+      try { socket.emit('tv_request_state') } catch {}
+    }
+    socket.on('connect', onConn)
+    return () => { socket.off('connect', onConn) }
   }, [socket])
 
   // preload camera shutter audio
@@ -338,15 +511,33 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
     }
   }, [socket])
 
-  // Initialize player once API ready
+  // Initialize/restore YouTube player once API ready (only when not in WebRTC)
   useEffect(() => {
+    if (useWebRtc) return
     if (!apiReady || playerRef.current) return
     playerRef.current = new window.YT.Player('tv-player', {
       width: '1280', height: '720',
       playerVars: { controls: 0, fs: 0, disablekb: 1, modestbranding: 1, rel: 0, iv_load_policy: 3, playsinline: 1, autoplay: 1 },
       events: { onReady, onStateChange, onError }
     })
-  }, [apiReady])
+  }, [apiReady, useWebRtc])
+
+  // If YouTube is active and enters an unexpected unstarted/blank state, force reload
+  useEffect(() => {
+    if (useWebRtc) return
+    const p = playerRef.current
+    if (!p) return
+    const t = setInterval(() => {
+      try {
+        const st = p.getPlayerState?.()
+        // -1: unstarted, 5: cued but not playing; kick it
+        if (st === -1 || st === 5) {
+          p.playVideo?.()
+        }
+      } catch {}
+    }, 5000)
+    return () => clearInterval(t)
+  }, [useWebRtc])
 
   // Watchdog: if no state/playing within a few seconds after refresh, ask server and retry play
   useEffect(() => {
@@ -482,13 +673,13 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
       {/* Admin inline controls removed in favor of slide-out panel */}
       {/* Hidden helper container for playlist introspection */}
       <div id="tv-helper" style={{ position: 'absolute', width: 0, height: 0, overflow: 'hidden' }} />
-      {!capturing && adminIds.includes(socket?.id) && !captureReady && (
+      {!capturing && !uiHidden && adminIds.includes(socket?.id) && !captureReady && (
         <button
           className="tv-ui absolute top-3 right-3 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
           onClick={enableCapture}
         >Enable capture</button>
       )}
-      {!capturing && captureReady && (
+      {!capturing && !uiHidden && captureReady && (
         <div className="tv-ui absolute top-3 right-3 z-50 text-[10px] px-2 py-1 rounded bg-green-600/30 border border-green-400/60">
           Capture ON
         </div>
@@ -499,14 +690,14 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
         </div>
       )}
       {/* Admin panel toggle */}
-      {!capturing && adminIds.includes(socket?.id) && (
+      {!capturing && !uiHidden && adminIds.includes(socket?.id) && (
         <button
           className="tv-ui absolute top-3 right-24 z-50 text-xs px-3 py-1 rounded bg-white/10 hover:bg-white/20"
           onClick={() => setAdminOpen(v => !v)}
         >{adminOpen ? 'Close' : 'Admin'}</button>
       )}
       {/* Slide-out admin panel */}
-      {adminIds.includes(socket?.id) && (
+      {adminIds.includes(socket?.id) && !uiHidden && (
         <div className={`tv-ui fixed top-0 right-0 h-full w-80 z-50 bg-black/80 border-l border-white/15 transition-transform duration-200 ${adminOpen ? 'translate-x-0' : 'translate-x-full'}`}
              onKeyDown={(e) => { if (e.key === 'Escape') setAdminOpen(false) }}>
           <div className="p-3 space-y-2 text-[11px] relative">
@@ -540,42 +731,76 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
               }}>Queue playlist</button>
               <button className="px-2 py-1 rounded bg-white/10 hover:bg-white/20" onClick={() => { try { socket?.emit('tv_admin_clear_queue') } catch {} }}>Clear queue</button>
             </div>
+            <div className="flex items-center gap-2">
+              <label className="opacity-70">Live</label>
+              <button className={`px-2 py-1 rounded ${liveDesired ? 'bg-green-600/40' : 'bg-white/10'} hover:bg-white/20`} onClick={() => {
+                const next = !liveDesired; setLiveDesired(next);
+                try { socket?.emit('tv_admin_live', { on: next }) } catch {}
+                if (next) setUseWebRtc(true); else setUseWebRtc(false)
+              }}>{liveDesired ? 'On' : 'Off'}</button>
+            </div>
             <div className="text-xs text-zinc-400">Esc closes panel</div>
           </div>
         </div>
       )}
-      {!capturing && (
+      {!capturing && !uiHidden && (
         <button
           className="tv-ui absolute bottom-3 left-3 z-20 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
           onClick={() => setDnd(v => !v)}
         >{dnd ? 'DND: ON (no chats)' : 'DND: OFF (allow chats)'}</button>
       )}
+      {!capturing && !uiHidden && (
+        <div className="tv-ui absolute bottom-3 left-40 z-20 text-[11px] px-2 py-1 rounded bg-white/10 border border-white/15 select-none">
+          Ctrl+H to hide UI
+        </div>
+      )}
+      {/* Viewer counts near time counter (bottom center, to the right) */}
+      {!uiHidden && (
+      <div className="tv-ui fixed z-20 text-[11px] px-2 py-1 rounded bg-white/10 border border-white/15 flex items-center gap-2"
+           style={{ bottom: '12px', left: 'calc(50% + 90px)' }}>
+        <span className="text-green-400 font-mono">{viewCounts.watching}</span>
+        <span className="text-red-400 font-mono">{viewCounts.altTabbed}</span>
+      </div>
+      )}
       <div className="w-full h-full relative">
         {/* Video area centered with letterboxing */}
         <div className="absolute bg-black" style={{ width: videoSize.width + 'px', height: videoSize.height + 'px', left: videoSize.left + 'px', top: videoSize.top + 'px' }}>
-          <div id="tv-player" className="bg-black" style={{ width: '100%', height: '100%' }} />
+          {/* We keep both elements mounted to avoid React removing/adding during rapid switches */}
+          <div className="absolute inset-0" style={{ opacity: useWebRtc ? 1 : 0, pointerEvents: useWebRtc ? 'auto' : 'none' }}>
+            <video ref={webrtcVideoRef} id="webrtc-player" className="bg-black" style={{ width: '100%', height: '100%' }} playsInline autoPlay muted />
+          </div>
+          <div className="absolute inset-0" style={{ opacity: useWebRtc ? 0 : 1, pointerEvents: useWebRtc ? 'none' : 'auto' }}>
+            <div id="tv-player" className="bg-black" style={{ width: '100%', height: '100%' }} />
+          </div>
           {/* Click blocker to keep visual-only */}
           {!capturing && (
-            <div className="tv-ui absolute inset-0 z-20" style={{ pointerEvents: 'auto' }} />
+            <div className="absolute inset-0 z-20" style={{ pointerEvents: 'auto' }} />
           )}
           {/* Enable sound button */}
-          {!capturing && isMuted && (
+          {!capturing && !uiHidden && isMuted && (
             <button
               className="tv-ui absolute bottom-3 right-3 z-30 px-3 py-1 rounded bg-white/10 backdrop-blur text-white text-xs hover:bg-white/20"
               onClick={() => {
                 try {
-                  const p = playerRef.current
-                  if (!p) return
-                  p.unMute?.()
-                  p.setVolume?.(volume)
-                  // some browsers require a play() call after unmuting
-                  try { p.playVideo?.() } catch {}
+                  if (useWebRtc) {
+                    const v = webrtcVideoRef.current
+                    if (!v) return
+                    v.muted = false
+                    v.volume = Math.max(0, Math.min(1, volume / 100))
+                    try { v.play() } catch {}
+                  } else {
+                    const p = playerRef.current
+                    if (!p) return
+                    p.unMute?.()
+                    p.setVolume?.(volume)
+                    try { p.playVideo?.() } catch {}
+                  }
                   setIsMuted(false)
                 } catch {}
               }}
             >Enable sound</button>
           )}
-          {!capturing && !isMuted && (
+          {!capturing && !uiHidden && !isMuted && (
             <div className="tv-ui absolute bottom-3 right-3 z-30 flex items-center gap-2 px-2 py-1 rounded bg-white/10 backdrop-blur text-white text-xs">
               <span>Vol</span>
               <input
@@ -588,7 +813,14 @@ export default function TV({ socket, adminIds = [], onExit, onEnterTV, onLeaveTV
                   const v = Number(e.target.value)
                   setVolume(v)
                   try { localStorage.setItem('tv_volume', String(v)) } catch {}
-                  try { playerRef.current?.setVolume?.(v) } catch {}
+                  try {
+                    if (useWebRtc) {
+                      const el = webrtcVideoRef.current
+                      if (el) el.volume = Math.max(0, Math.min(1, v / 100))
+                    } else {
+                      playerRef.current?.setVolume?.(v)
+                    }
+                  } catch {}
                 }}
               />
             </div>

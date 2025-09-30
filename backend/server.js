@@ -60,6 +60,8 @@ let tvPlaybackRate = 1;
 let tvPaused = false;
 // Admin queue of explicit next videos (videoIds). When non-empty, these take precedence.
 let tvQueue = [];
+// Live mode (admin toggles WebRTC activation signal for clients)
+let tvLive = false;
 
 // --- Device time tracking ---
 // deviceId -> { totalMs: number, lastCountedSec?: number, lastBeatMs?: number }
@@ -133,6 +135,8 @@ io.on('connection', (socket) => {
   socket.emit('pinups', { list: pinups });
   // Send current TV users snapshot
   socket.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+  // Send current live flag
+  socket.emit('tv_live', { on: tvLive });
 
   // Device identification
   socket.on('identify', ({ deviceId }) => {
@@ -371,6 +375,15 @@ io.on('connection', (socket) => {
     } catch {}
   });
 
+  // Admin toggles live mode (WebRTC desired)
+  socket.on('tv_admin_live', ({ on }) => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      tvLive = !!on;
+      io.to('tv').emit('tv_live', { on: tvLive });
+    } catch {}
+  });
+
   socket.on('tv_admin_skip', () => {
     try {
       if (!adminSockets.has(socket.id)) return;
@@ -557,6 +570,15 @@ setInterval(() => {
     const state = computeTvRoomState();
     if (state) io.to('tv').emit('tv_room_state', state);
   }
+  // TV view counts once per tick
+  try {
+    let watching = 0, altTabbed = 0;
+    for (const id of tvUsers) {
+      const a = socketActivity.get(id) || { visible: false, isActive: false };
+      if (a.visible && a.isActive) watching++; else altTabbed++;
+    }
+    io.to('tv').emit('tv_view_counts', { watching, altTabbed });
+  } catch {}
 }, 1000);
 
 function computeTvRoomState() {

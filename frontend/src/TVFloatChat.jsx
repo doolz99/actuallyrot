@@ -164,7 +164,7 @@ export default function TVFloatChat({ socket, width = 1280, height = 260, adminI
         candidate = { x, y }
       }
       placed.push({ x: candidate.x, y: candidate.y, w, h })
-      boxes.push({ id: 'p:' + pid, x: candidate.x, y: candidate.y, w, h, fontPx, text: pv.text, preview: true, mine: pid === (socket?.id || '') })
+      boxes.push({ id: 'p:' + pid, senderId: pid, x: candidate.x, y: candidate.y, w, h, fontPx, text: pv.text, preview: true, mine: pid === (socket?.id || '') })
     }
     return boxes
   }
@@ -222,20 +222,36 @@ export default function TVFloatChat({ socket, width = 1280, height = 260, adminI
     <div className="relative" style={{ width: width + 'px', height: height + 'px' }}>
       {/* Floaters layer - fully transparent background */}
       <div ref={containerRef} className="absolute inset-0" style={{ pointerEvents: 'none' }}>
-        {layout.map(b => (
-          b.preview ? (
-            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: adminIds.includes(b.id) ? '#ff2d2d' : 'white', opacity: 0.8, textShadow: adminIds.includes(b.id) ? '0 0 10px rgba(255,80,80,0.6), 0 0 22px rgba(255,50,50,0.35)' : '0 0 8px rgba(255,80,80,0.45), 0 0 18px rgba(255,50,50,0.25)' }}>
+        {layout.map(b => {
+          const palette = ['#5AD1E6','#FFD166','#06D6A0','#A78BFA','#F4A261','#2EC4B6','#E07A5F','#8AC926','#FF7F50','#90CAF9','#F28D35','#EF476F']
+          const hexToRgba = (hex, a) => {
+            try {
+              const h = hex.replace('#','')
+              const bigint = parseInt(h.length===3 ? h.split('').map(x=>x+x).join('') : h, 16)
+              const r = (bigint >> 16) & 255, g = (bigint >> 8) & 255, bl = bigint & 255
+              return `rgba(${r}, ${g}, ${bl}, ${a})`
+            } catch { return 'rgba(255,255,255,0.6)' }
+          }
+          const colorFor = (id) => {
+            try { const idx = (hashString(String(id)) % palette.length); return palette[idx] } catch { return '#ffffff' }
+          }
+          const sender = b.senderId
+          const isAdmin = adminIds.includes(sender)
+          const color = isAdmin ? '#ff2d2d' : colorFor(sender)
+          const shadow = isAdmin ? '0 0 10px rgba(255,80,80,0.8), 0 0 22px rgba(255,50,50,0.5)' : `0 0 12px ${hexToRgba(color, 0.6)}`
+          return b.preview ? (
+            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color, opacity: 0.9, textShadow: shadow }}>
               {b.text}
               {b.mine && (
                 <span className="tv-caret" style={{ display: 'inline-block', width: '2px', height: '1em', background: 'white', marginLeft: '3px', verticalAlign: 'baseline' }} />
               )}
             </div>
           ) : (
-            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color: adminIds.includes(b.senderId) ? '#ff2d2d' : 'white', textShadow: adminIds.includes(b.senderId) ? '0 0 10px rgba(255,80,80,0.8), 0 0 22px rgba(255,50,50,0.5)' : '0 0 12px rgba(255,255,255,0.6)' }}>
+            <div key={b.id} className="absolute select-none" style={{ left: b.x + 'px', top: b.y + 'px', maxWidth: Math.floor(width*0.7) + 'px', fontFamily: 'Impact, sans-serif', fontSize: b.fontPx + 'px', lineHeight: 1.2, color, textShadow: shadow }}>
               {b.text}
             </div>
           )
-        ))}
+        })}
       </div>
       {/* Hidden input; users type normally, caret not shown to others */}
       <input

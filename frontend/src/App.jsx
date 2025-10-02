@@ -4,6 +4,7 @@ import Circles from './Circles.jsx'
 import Chat from './Chat.jsx'
 import Gate from './Gate.jsx'
 import TV from './TV.jsx'
+import Sequencer from './Sequencer.jsx'
 import { playJoinSound, playPairSound, playSendSound, playReceiveSound, playConnectSound, playDisconnectSound } from './audio'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'
@@ -11,7 +12,7 @@ const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'
 export default function App() {
   const socket = useMemo(() => io(BACKEND_URL, { autoConnect: true }), [])
 
-  const [view, setView] = useState('lobby') // 'lobby' | 'chat' | 'tv'
+  const [view, setView] = useState('lobby') // 'lobby' | 'chat' | 'tv' | 'sequencer'
   // One-time gate per session
   const [showGate, setShowGate] = useState(() => {
     try { return sessionStorage.getItem('rv_seen_gate') ? false : true } catch { return true }
@@ -27,6 +28,7 @@ export default function App() {
   const [pairRot, setPairRot] = useState({}) // key "a|b" -> 'red'|'blue'|'none'
   const [tvIds, setTvIds] = useState([])
   const [adminIds, setAdminIds] = useState([])
+  const [seqIds, setSeqIds] = useState([])
   const [pinups, setPinups] = useState([])
   const [hasData, setHasData] = useState(false)
   const [stuck, setStuck] = useState(false)
@@ -201,6 +203,10 @@ export default function App() {
       if (!snap || typeof snap !== 'object') return
       setPairRot(snap.rot || {})
     })
+    socket.on('seq_snapshot', (snap) => {
+      if (!snap || typeof snap !== 'object') return
+      setSeqIds(Array.isArray(snap.ids) ? snap.ids : [])
+    })
     socket.on('tv_snapshot', (snap) => {
       if (!snap || typeof snap !== 'object') return
       setTvIds(Array.isArray(snap.ids) ? snap.ids : [])
@@ -224,6 +230,7 @@ export default function App() {
       socket.off('pinups_update')
       socket.off('chat_blocked')
       socket.off('pair_rot_state')
+      socket.off('seq_snapshot')
       socket.off('tv_snapshot')
       socket.off('times_snapshot')
       clearTimeout(t)
@@ -348,8 +355,13 @@ export default function App() {
           tvIds={tvIds}
           adminIds={adminIds}
           pinups={pinups}
+          seqIds={seqIds}
           onRequestChat={handleRequestChat}
           onOpenTV={() => setView('tv')}
+          onOpenSequencer={() => {
+            try { socket.emit('seq_state', { inSeq: true }) } catch {}
+            setView('sequencer')
+          }}
         />
       )}
       {!showGate && view === 'chat' && (
@@ -369,6 +381,9 @@ export default function App() {
       )}
       {!showGate && view === 'tv' && (
         <TV socket={socket} adminIds={adminIds} onExit={() => setView('lobby')} onEnterTV={() => socket.emit('tv_state', { inTv: true })} onLeaveTV={() => socket.emit('tv_state', { inTv: false })} onSetDnd={handleSetDnd} />
+      )}
+      {!showGate && view === 'sequencer' && (
+        <Sequencer socket={socket} onBack={() => { try { socket.emit('seq_state', { inSeq: false }) } catch {} setView('lobby') }} />
       )}
       {/* Self timer bottom overlay */}
       {!!selfId && (

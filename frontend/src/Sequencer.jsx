@@ -1,16 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { colorForKey } from './color'
+import { playSf, ensureSoundfontInstrument, sfLoaded, stopSfNode } from './audio'
 
 export default function Sequencer({ socket, onBack }) {
   const BACKEND_URL = (import.meta.env && import.meta.env.VITE_BACKEND_URL) ? String(import.meta.env.VITE_BACKEND_URL) : 'http://localhost:3001'
   const [song, setSong] = useState(null)
+  const songRef = useRef(null)
+  useEffect(() => { songRef.current = song }, [song])
   const [rev, setRev] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [tempo, setTempo] = useState(120)
   const [baseBar, setBaseBar] = useState(0)
   const [baseTsMs, setBaseTsMs] = useState(Date.now())
-  const songId = 'default'
+  const [songId, setSongId] = useState('default')
   // Audio + scheduler
   const audioCtxRef = useRef(null)
   const masterRef = useRef(null)
@@ -51,6 +54,8 @@ export default function Sequencer({ socket, onBack }) {
   const [selfPos, setSelfPos] = useState({ nx: 0.5, ny: 0.5 })
   const [remoteTyping, setRemoteTyping] = useState({}) // id -> { text, nx, ny, ts }
   const rafRef = useRef(0)
+  const patMarkerPxRef = useRef(0)
+  const arrMarkerPxRef = useRef(0)
   const gridRef = useRef(null)
   const arrGridRef = useRef(null)
   const gridScrollRef = useRef(null)
@@ -77,22 +82,209 @@ export default function Sequencer({ socket, onBack }) {
   const [zoomX, setZoomX] = useState(1)
   const [zoomY, setZoomY] = useState(1)
   const [patternBars, setPatternBars] = useState(4)
-  const [mode, setMode] = useState('pattern') // 'pattern' | 'arrangement'
+  const [mode, setMode] = useState('arrangement') // default to arrangement
+  const [linkClipToPattern, setLinkClipToPattern] = useState(true)
+  const [independentPattern, setIndependentPattern] = useState(false)
+  const [localPatternId, setLocalPatternId] = useState(null)
+  const [selectedClipIds, setSelectedClipIds] = useState(new Set())
+  // Pattern-from-loop preview
+  const [loopMakeOn, setLoopMakeOn] = useState(false)
+  const [loopMakeTrack, setLoopMakeTrack] = useState(0)
+  const lastArrTrackRef = useRef(0)
+  const loopTrackRef = useRef(null)
+  // Arrangement loop state (shared via song)
+  const [loopOn, setLoopOn] = useState(false)
+  const [loopStartStep, setLoopStartStep] = useState(0)
+  const [loopEndStep, setLoopEndStep] = useState(0)
+  // Independent loop is implied by Independent mode; local state retained for loop values only
+  const [localLoopOn, setLocalLoopOn] = useState(false)
+  const [localLoopStartStep, setLocalLoopStartStep] = useState(0)
+  const [localLoopEndStep, setLocalLoopEndStep] = useState(0)
+  useEffect(() => {
+    if (independentPattern) {
+      setLocalLoopOn(!!loopOn)
+      setLocalLoopStartStep(loopStartStep)
+      setLocalLoopEndStep(loopEndStep)
+    } else {
+      setLocalLoopOn(false)
+    }
+  }, [independentPattern, loopOn, loopStartStep, loopEndStep])
+  const loopDragRef = useRef({ active: false, start: 0 })
   const scrollSyncRef = useRef(false)
   const ARR_SCALE = 0.4
   const stepWPattern = STEP_UNIT * zoomX
   const stepWArr = STEP_UNIT * zoomX * ARR_SCALE
-  const [arrSnap, setArrSnap] = useState('1/2') // '1' | '1/2' | '1/4' | '1/8'
+  const [arrSnap, setArrSnap] = useState('1/8') // '1' | '1/2' | '1/4' | '1/8'
   const [autoResizeClips, setAutoResizeClips] = useState(false)
   const placeRef = useRef({ active: false, track: 0, startStep: 0, lengthSteps: 0, dragging: false, startX: 0, startY: 0, valid: true })
   const [ghost, setGhost] = useState({ on: false, left: 0, top: 0, width: 0, bad: false })
   const [metronomeOn, setMetronomeOn] = useState(false)
   const [countInOn, setCountInOn] = useState(false)
   const countInRef = useRef({ active: false, endStep: 0 })
+  // Save/Load (simple REST to backend)
+  const [songSaveId, setSongSaveId] = useState('default')
+  const [songsList, setSongsList] = useState([])
+  const [isAdmin, setIsAdmin] = useState(false)
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem('isAdmin')
+      const on = v === '1'
+      setIsAdmin(on)
+      try { socket?.emit?.('identify_admin', { isAdmin: on }) } catch {}
+    } catch {}
+  }, [socket])
+  useEffect(() => {
+    try {
+      localStorage.setItem('isAdmin', isAdmin ? '1' : '0')
+      try { socket?.emit?.('identify_admin', { isAdmin }) } catch {}
+    } catch {}
+  }, [isAdmin, socket])
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.ctrlKey && e.altKey && (e.key === 'a' || e.key === 'A')) {
+        e.preventDefault(); e.stopPropagation();
+        setIsAdmin(prev => !prev)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+  async function saveSongSnapshot(id) {
+    try {
+      if (!id || !song) return
+      await fetch(`${BACKEND_URL.replace(/\/$/, '')}/songs/${encodeURIComponent(id)}` , {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ song })
+      })
+      // refresh list so it appears immediately
+      listSongs()
+    } catch {}
+  }
+  async function loadSongSnapshot(id) {
+    try {
+      if (!id) return
+      setSongSaveId(id)
+      // Switch everyone to this song id; server will emit seq_song snapshot
+      try { socket?.emit?.('seq_switch_song', { id }) } catch {}
+    } catch {}
+  }
+  async function listSongs() {
+    try {
+      const res = await fetch(`${BACKEND_URL.replace(/\/$/, '')}/songs`)
+      const data = await res.json().catch(()=>null)
+      if (data && Array.isArray(data.ids)) setSongsList(data.ids)
+    } catch {}
+  }
+  function newSharedSong() {
+    try {
+      let def = 'song-' + Date.now().toString(36)
+      const id = prompt('New song id', def)
+      if (!id) return
+      setSongSaveId(id)
+      try { socket?.emit?.('seq_switch_song', { id }) } catch {}
+    } catch {}
+  }
+  function deleteSong(id) {
+    try {
+      const target = id || songSaveId
+      if (!target) return
+      if (!confirm(`Delete song "${target}"?`)) return
+      // Requires admin on server; no-op if not admin
+      socket?.emit?.('seq_delete_song', { id: target })
+      // Optimistically remove from local list
+      setSongsList(prev => Array.isArray(prev) ? prev.filter(x => x !== target) : prev)
+      // Refresh list after a short delay
+      setTimeout(()=> listSongs(), 200)
+    } catch {}
+  }
   const stepWRef = useRef(STEP_UNIT)
   const [placeLenSteps, setPlaceLenSteps] = useState(4)
-  const SYNTHS = ['Triangle','Square','Saw','Sine','Pluck','Bass','Bell','SuperSaw','Organ','EPiano','WarmPad','PWM','Sub','Choir']
+  const SYNTHS = ['Triangle','Square','Saw','Sine','Pluck','Bass','Bell','SuperSaw','Organ','EPiano','WarmPad','PWM','Sub','Choir','PianoSF','StringsSF','BassSF','EPianoSF','ChoirSF']
   const [synth, setSynth] = useState('Triangle')
+  const SF_INSTR_MAP = {
+    PianoSF: 'acoustic_grand_piano',
+    StringsSF: 'string_ensemble_1',
+    BassSF: 'acoustic_bass',
+    EPianoSF: 'electric_piano_1',
+    ChoirSF: 'choir_aahs'
+  }
+  function SfInstrumentList({ query, onPick }) {
+    const q = String(query||'').toLowerCase().trim()
+    // Core GM melodic names (subset for brevity; supports search of any name via CDN)
+    const groups = [
+      { name:'Pianos', items:['acoustic_grand_piano','bright_acoustic_piano','electric_grand_piano','honkytonk_piano','electric_piano_1','electric_piano_2'] },
+      { name:'Organs', items:['drawbar_organ','percussive_organ','rock_organ'] },
+      { name:'Guitars', items:['acoustic_guitar_nylon','acoustic_guitar_steel','electric_guitar_jazz','electric_guitar_clean','electric_guitar_muted'] },
+      { name:'Basses', items:['acoustic_bass','electric_bass_finger','electric_bass_pick','fretless_bass','slap_bass_1'] },
+      { name:'Strings', items:['violin','viola','cello','contrabass','tremolo_strings','pizzicato_strings','string_ensemble_1','string_ensemble_2'] },
+      { name:'Brass', items:['trumpet','trombone','tuba','french_horn','brass_section'] },
+      { name:'Reeds/Winds', items:['soprano_sax','alto_sax','tenor_sax','baritone_sax','oboe','english_horn','bassoon','clarinet','flute','recorder'] },
+      { name:'Synth Leads', items:['lead_1_square','lead_2_sawtooth','lead_3_calliope','lead_4_chiff','lead_5_charang','lead_6_voice','lead_7_fifths','lead_8_bass__lead'] },
+      { name:'Synth Pads', items:['pad_1_new_age','pad_2_warm','pad_3_polysynth','pad_4_choir','pad_5_bowed','pad_6_metallic','pad_7_halo','pad_8_sweep'] },
+      { name:'Synth FX', items:['fx_1_rain','fx_2_soundtrack','fx_3_crystal','fx_4_atmosphere','fx_5_brightness','fx_6_goblins','fx_7_echoes','fx_8_scifi'] }
+    ]
+    return (
+      <div className="flex flex-col gap-2">
+        {groups.map(g => {
+          const items = g.items.filter(n => !q || n.includes(q))
+          if (!items.length) return null
+          return (
+            <div key={g.name}>
+              <div className="text-xs uppercase tracking-wide text-white/60 px-1 py-1">{g.name}</div>
+              <div className="grid grid-cols-2 gap-1">
+                {items.map(name => (
+                  <button key={name} className="text-left px-2 py-1 rounded bg-white/5 hover:bg-white/15 text-white/90" onClick={()=> onPick(name)}>
+                    {name.replaceAll('_',' ')}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+  function isSfSynth(name) {
+    const s = String(name||'')
+    return !!SF_INSTR_MAP[s] || s.startsWith('SF:')
+  }
+  function sfInstrFromSynthName(name) {
+    const s = String(name||'')
+    if (s.startsWith('SF:')) return s.slice(3)
+    return SF_INSTR_MAP[s]
+  }
+  const [sfPaletteOpen, setSfPaletteOpen] = useState(false)
+  const [sfQuery, setSfQuery] = useState('')
+  // Instrument mode (play with computer keyboard)
+  const [instOn, setInstOn] = useState(false)
+  const [instOct, setInstOct] = useState(0)
+  const [instVel, setInstVel] = useState(8) // 1..9
+  const heldKeysRef = useRef(new Set())
+  // Compose (step-time) mode
+  const [composeOn, setComposeOn] = useState(false)
+  const [composeStep, setComposeStep] = useState(0)
+  const [composeClipId, setComposeClipId] = useState(null)
+  const composeDownRef = useRef(new Map()) // key -> {tsMs, midi, vel, osc, g}
+  const [composeGhostTick, setComposeGhostTick] = useState(0)
+  const chordActiveKeysRef = useRef(new Set())
+  const chordStartStepRef = useRef(0)
+  const chordMaxStepsRef = useRef(0)
+  const heldOscsRef = useRef(new Map())
+  const chordStartTsRef = useRef(0)
+  const composeCaretRef = useRef(null)
+  const composeGhostRefsRef = useRef({})
+  const composePrevPlayedRef = useRef(new Set())
+  const composeVoicesRef = useRef(new Map())
+  const caretStepFloatPrevRef = useRef(NaN)
+  const composeLiveStepRef = useRef(0)
+  // Pending arrangement clip updates to guard against server echo reordering
+  const pendingClipUpdatesRef = useRef(new Map()) // id -> { startStep?, track?, lengthSteps?, ts }
+  function wrapPitchToVisible(p) {
+    let x = Number(p)||60
+    while (x > PITCH_MAX) x -= 12
+    while (x < PITCH_MIN) x += 12
+    return Math.max(PITCH_MIN, Math.min(PITCH_MAX, x))
+  }
+  // (removed duplicate compose state)
   const SYNTH_COLOR = {
     Triangle: 'linear-gradient(to bottom, rgba(255,213,74,0.95), rgba(255,213,74,0.7))',
     Square: 'linear-gradient(to bottom, rgba(74,222,128,0.95), rgba(74,222,128,0.7))',
@@ -108,6 +300,11 @@ export default function Sequencer({ socket, onBack }) {
     PWM: 'linear-gradient(to bottom, rgba(244,114,182,0.95), rgba(244,114,182,0.7))',
     Sub: 'linear-gradient(to bottom, rgba(250,204,21,0.95), rgba(250,204,21,0.7))',
     Choir: 'linear-gradient(to bottom, rgba(20,184,166,0.95), rgba(20,184,166,0.7))',
+    'PianoSF': 'linear-gradient(to bottom, rgba(248,250,252,0.95), rgba(248,250,252,0.7))',
+    'StringsSF': 'linear-gradient(to bottom, rgba(248,113,113,0.95), rgba(248,113,113,0.7))',
+    'BassSF': 'linear-gradient(to bottom, rgba(191,219,254,0.95), rgba(191,219,254,0.7))',
+    'EPianoSF': 'linear-gradient(to bottom, rgba(165,180,252,0.95), rgba(165,180,252,0.7))',
+    'ChoirSF': 'linear-gradient(to bottom, rgba(196,181,253,0.95), rgba(196,181,253,0.7))'
   }
   // Dim, uniform 2px-high preview colors per synth
   const PREVIEW_COLOR = {
@@ -124,7 +321,29 @@ export default function Sequencer({ socket, onBack }) {
     WarmPad: 'rgba(99,102,241,0.55)',
     PWM: 'rgba(244,114,182,0.55)',
     Sub: 'rgba(250,204,21,0.55)',
-    Choir: 'rgba(20,184,166,0.55)'
+    Choir: 'rgba(20,184,166,0.55)',
+    'PianoSF': 'rgba(248,250,252,0.55)',
+    'StringsSF': 'rgba(248,113,113,0.55)',
+    'BassSF': 'rgba(191,219,254,0.55)',
+    'EPianoSF': 'rgba(165,180,252,0.55)',
+    'ChoirSF': 'rgba(196,181,253,0.55)'
+  }
+
+  // Dynamic colors for any SF:<instrument> chosen from More… palette
+  function sfHue(name) {
+    let h = 0; const s = String(name||'sf')
+    for (let i=0;i<s.length;i++) { h = ((h<<5)-h) + s.charCodeAt(i); h|=0 }
+    return Math.abs(h % 360)
+  }
+  function sfGradientFor(instName) {
+    const h = sfHue(instName)
+    const top = `hsl(${h} 70% 62% / 0.95)`
+    const bot = `hsl(${h} 70% 48% / 0.70)`
+    return `linear-gradient(to bottom, ${top}, ${bot})`
+  }
+  function sfPreviewFor(instName) {
+    const h = sfHue(instName)
+    return `hsl(${h} 70% 55% / 0.55)`
   }
 
   // Kill circles melody if any
@@ -133,10 +352,56 @@ export default function Sequencer({ socket, onBack }) {
   // Socket wiring
   useEffect(() => {
     if (!socket) return
-    const onSong = ({ song, rev }) => { setSong(song); setRev(rev); setTempo(song.tempo) }
-    const onCursor = ({ from, nx, ny, sect, sx, sy, track, ty, ts }) => {
+    const onSong = ({ song, rev }) => {
+      // Preserve any locally pending clip fields; merge server song with local pending values
+      const merged = (() => {
+        try {
+          const pend = pendingClipUpdatesRef.current
+          if (!pend || !(pend instanceof Map) || !Array.isArray(song?.clips)) return song
+          const list = song.clips.map(c => {
+            const p = pend.get(c.id)
+            if (!p) return c
+            return {
+              ...c,
+              startStep: (p.startStep !== undefined ? p.startStep : c.startStep),
+              track: (p.track !== undefined ? p.track : c.track),
+              lengthSteps: (p.lengthSteps !== undefined ? p.lengthSteps : c.lengthSteps)
+            }
+          })
+          return { ...song, clips: list }
+        } catch { return song }
+      })()
+      // If we have pending fields and the merged song equals our local current, clear acks
+      try {
+        const pend = pendingClipUpdatesRef.current
+        if (pend && pend.size) {
+          const cur = songRef.current
+          if (cur && Array.isArray(cur.clips)) {
+            for (const [id, rec] of Array.from(pend.entries())) {
+              const sv = (merged?.clips||[]).find(c => c.id === id)
+              if (!sv) continue
+              const ackStart = rec.startStep === undefined || sv.startStep === rec.startStep
+              const ackTrack = rec.track === undefined || sv.track === rec.track
+              const ackLen = rec.lengthSteps === undefined || sv.lengthSteps === rec.lengthSteps
+              if (ackStart && ackTrack && ackLen) pend.delete(id)
+            }
+          }
+        }
+      } catch {}
+      setSong(merged); setRev(rev); setTempo(song.tempo)
+      if (!independentPattern) {
+        if (typeof song.loopOn === 'boolean') setLoopOn(!!song.loopOn)
+        if (Number.isFinite(song.loopStartStep)) setLoopStartStep(Number(song.loopStartStep)||0)
+        if (Number.isFinite(song.loopEndStep)) setLoopEndStep(Number(song.loopEndStep)||0)
+      }
+    }
+    const onCursor = ({ from, nx, ny, sect, sx, sy, track, ty, ts, clear }) => {
       try {
         if (!from || from === socket.id) return
+        if (clear) {
+          setRemoteCursors(prev => { const next = { ...prev }; delete next[from]; return next })
+          return
+        }
         const rec = {}
         if (isFinite(nx) && isFinite(ny)) { rec.nx = Math.max(0, Math.min(1, Number(nx))); rec.ny = Math.max(0, Math.min(1, Number(ny))) }
         if (typeof sect === 'string') rec.sect = sect
@@ -261,9 +526,36 @@ export default function Sequencer({ socket, onBack }) {
             const idx = list.findIndex(c => c.id === id)
             if (idx >= 0) {
               const u = { ...list[idx] }
-              if (op.track !== undefined) u.track = Math.max(0, Math.min(3, Number(op.track)))
-              if (op.startStep !== undefined) u.startStep = Math.max(0, Number(op.startStep)||0)
-              if (op.lengthSteps !== undefined) u.lengthSteps = Math.max(1, Number(op.lengthSteps)||1)
+              // If we have a pending local update, only accept server values that
+              // acknowledge the same value; otherwise ignore to prevent snap-back.
+              const pend = pendingClipUpdatesRef.current.get(id)
+              const nowTs = Date.now()
+              const TTL = 5000
+              function applyOrAck(field, serverVal, clampFn) {
+                if (!pend || pend[field] === undefined) {
+                  u[field] = clampFn(serverVal)
+                  return
+                }
+                const want = clampFn(pend[field])
+                const got = clampFn(serverVal)
+                if (got === want) {
+                  // ack: accept and clear this pending field
+                  u[field] = got
+                  const np = { ...pend }
+                  delete np[field]
+                  if (!('startStep' in np) && !('track' in np) && !('lengthSteps' in np)) pendingClipUpdatesRef.current.delete(id)
+                  else { np.ts = nowTs; pendingClipUpdatesRef.current.set(id, np) }
+                } else if (nowTs - (pend.ts||0) > TTL) {
+                  // stale: drop pending and accept server
+                  u[field] = got
+                  pendingClipUpdatesRef.current.delete(id)
+                } else {
+                  // keep local; ignore server for this field
+                }
+              }
+              if (op.track !== undefined) applyOrAck('track', Number(op.track), (v)=> Math.max(0, Math.min(3, Number(v))))
+              if (op.startStep !== undefined) applyOrAck('startStep', Number(op.startStep)||0, (v)=> Math.max(0, Number(v)||0))
+              if (op.lengthSteps !== undefined) applyOrAck('lengthSteps', Number(op.lengthSteps)||1, (v)=> Math.max(1, Number(v)||1))
               list[idx] = u
             }
             next = { ...next, clips: list }
@@ -296,12 +588,23 @@ export default function Sequencer({ socket, onBack }) {
             const id = String(op.id || '')
             const list = Array.isArray(next.sfx) ? next.sfx.filter(s => s.id !== id) : []
             next = { ...next, sfx: list }
+          } else if (op.type === 'set_loop') {
+            const on = !!op.on
+            const spb = next.stepsPerBar || 16
+            const total = (next.bars||4) * spb
+            let a = Math.max(0, Math.min(total, Number(op.startStep)||0))
+            let b = Math.max(0, Math.min(total, Number(op.endStep)||0))
+            if (b < a) { const t=a; a=b; b=t }
+            next = { ...next, loopOn: on, loopStartStep: a, loopEndStep: b }
+            if (!independentPattern) { setLoopOn(on); setLoopStartStep(a); setLoopEndStep(b) }
           }
         }
         return next
       })
     }
-    const onTransport = ({ playing, baseBar, baseTsMs, tempo }) => {
+    const onTransport = ({ playing, baseBar, baseTsMs, tempo, from }) => {
+      // Ignore partner transport when in Independent mode
+      if (independentPattern && from && socket && from !== socket.id) return
       const pb = Number(baseBar)||0; const pts = Number(baseTsMs)||Date.now()
       setPlaying(!!playing); setBaseBar(pb); setBaseTsMs(pts); if (tempo) setTempo(tempo)
       try { schedRef.current.nextStep = Math.floor(pb * (song?.stepsPerBar || 16)) } catch {}
@@ -311,6 +614,8 @@ export default function Sequencer({ socket, onBack }) {
     socket.on('seq_transport', onTransport)
     socket.on('seq_cursor', onCursor)
     socket.on('seq_typing_preview', onTypingPreview)
+    socket.on('seq_active_song', ({ id }) => { if (typeof id === 'string' && id) { setSongId(id); setSongSaveId(id) } })
+    socket.on('songs_changed', () => { listSongs() })
     socket.on('sfx_uploaded', ({ name, url }) => {
       const abs = (typeof url === 'string' && /^https?:\/\//.test(url)) ? url : (BACKEND_URL.replace(/\/$/, '') + String(url || ''))
       setSfxLib(prev => {
@@ -321,8 +626,28 @@ export default function Sequencer({ socket, onBack }) {
       })
     })
     socket.emit('seq_join', { songId })
-    return () => { socket.off('seq_song', onSong); socket.off('seq_apply', onApply); socket.off('seq_transport', onTransport); socket.off('sfx_uploaded'); socket.off('seq_cursor', onCursor); socket.off('seq_typing_preview', onTypingPreview) }
-  }, [socket])
+    return () => { socket.off('seq_song', onSong); socket.off('seq_apply', onApply); socket.off('seq_transport', onTransport); socket.off('sfx_uploaded'); socket.off('seq_cursor', onCursor); socket.off('seq_typing_preview', onTypingPreview); socket.off('seq_active_song'); socket.off('songs_changed') }
+  }, [socket, independentPattern])
+  // Emit a cursor clear when leaving the sequencer (component unmount)
+  useEffect(() => {
+    return () => { try { socket?.emit?.('seq_cursor', { songId, cursor: { clear: true } }) } catch {} }
+  }, [socket, songId])
+
+  // Periodically prune stale remote cursors (e.g., partner closed tab)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now(); const TTL = 6500
+      setRemoteCursors(prev => {
+        let changed = false; const next = { ...prev }
+        for (const [id, c] of Object.entries(prev || {})) {
+          const ts = Number(c && c.ts)
+          if (!isFinite(ts) || (now - ts) > TTL) { delete next[id]; changed = true }
+        }
+        return changed ? next : prev
+      })
+    }, 3000)
+    return () => clearInterval(timer)
+  }, [])
   // Emit cursor helpers (throttled ~25fps)
   function emitCursor(next, isSection = false) {
     try {
@@ -411,8 +736,20 @@ export default function Sequencer({ socket, onBack }) {
   }
   function currentBarsVis() {
     if (!song) return 0
+    const spb = song.stepsPerBar
     const total = song.bars
     const raw = currentBarsRaw()
+    const effOn = independentPattern ? localLoopOn : loopOn
+    const effStart = independentPattern ? localLoopStartStep : loopStartStep
+    const effEnd = independentPattern ? localLoopEndStep : loopEndStep
+    if (effOn && effEnd > effStart) {
+      const startBars = effStart / spb
+      const endBars = effEnd / spb
+      const len = Math.max(1 / spb, endBars - startBars)
+      const rel = raw - startBars
+      const relMod = ((rel % len) + len) % len
+      return startBars + relMod
+    }
     // wrap into [0, total)
     return ((raw % total) + total) % total
   }
@@ -439,6 +776,16 @@ export default function Sequencer({ socket, onBack }) {
   function playNote(time, pitch, velocity, durationSec = 0.3, synthName = synth) {
     const ctx = audioCtxRef.current; const master = masterRef.current
     if (!ctx || !master) return
+    // Route to soundfont if SF synth selected
+    if (isSfSynth(synthName)) {
+      // apply small lead to counteract instrument latency
+      const inst = sfInstrFromSynthName(synthName) || 'acoustic_grand_piano'
+      const startAt = Math.max(ctx.currentTime, time - 0.008)
+      try { playSf(pitch, startAt, durationSec, Math.max(0.05, Math.min(1, velocity||0.8)), inst) } catch {}
+      return
+    }
+    // small lead for oscillator synths as well
+    time = Math.max(ctx.currentTime, time - 0.004)
     const g = ctx.createGain()
     let destination = master
     let attack = 0.01
@@ -581,23 +928,56 @@ export default function Sequencer({ socket, onBack }) {
     const lookahead = 0.25
     const nowBarsRaw = currentBarsRaw()
     const totalBars = song.bars
-    const nowBars = ((nowBarsRaw % totalBars) + totalBars) % totalBars
-    const nowStep = Math.floor(nowBars * song.stepsPerBar)
-    if (Math.abs(schedRef.current.nextStep - nowStep) > song.stepsPerBar * song.bars) {
+    // loop-aware reference bar position
+    let refBars = ((nowBarsRaw % totalBars) + totalBars) % totalBars
+    const effOn = independentPattern ? localLoopOn : loopOn
+    const effStart = independentPattern ? localLoopStartStep : loopStartStep
+    const effEnd = independentPattern ? localLoopEndStep : loopEndStep
+    if (effOn && effEnd > effStart) {
+      const spb = song.stepsPerBar
+      const startBars = effStart / spb
+      const endBars = effEnd / spb
+      const lenBars = Math.max(1 / spb, endBars - startBars)
+      const rel = nowBarsRaw - startBars
+      const relMod = ((rel % lenBars) + lenBars) % lenBars
+      refBars = startBars + relMod
+    }
+    const nowStep = Math.floor(refBars * song.stepsPerBar)
+    if (!Number.isFinite(schedRef.current.nextStep)) {
       schedRef.current.nextStep = nowStep
+    } else {
+      const drift = schedRef.current.nextStep - nowStep
+      const aheadSoft = song.stepsPerBar * 4
+      if (drift < -song.stepsPerBar || drift > aheadSoft) {
+        schedRef.current.nextStep = nowStep
+      }
     }
     const endTime = ctx.currentTime + lookahead
     let first = true
     while (true) {
       const step = schedRef.current.nextStep
-      const stepBars = (step / song.stepsPerBar) % totalBars
-      const deltaBars = stepBars - nowBars
-      let adj = deltaBars
-      if (adj < -totalBars/2) adj += totalBars
-      if (adj > totalBars/2) adj -= totalBars
-      let when = ctx.currentTime + adj * secondsPerBar(tempo)
+      const spb = song.stepsPerBar
+      const totalSteps = song.bars * spb
+      // Compute forward delta in steps relative to current step
+      let deltaSteps
+      const effOn2 = independentPattern ? localLoopOn : loopOn
+      const effStart2 = independentPattern ? localLoopStartStep : loopStartStep
+      const effEnd2 = independentPattern ? localLoopEndStep : loopEndStep
+      if (effOn2 && effEnd2 > effStart2) {
+        const loopLenSteps = Math.max(1, effEnd2 - effStart2)
+        const stepNorm = ((step - effStart2) % loopLenSteps + loopLenSteps) % loopLenSteps
+        const nowNorm = ((nowStep - effStart2) % loopLenSteps + loopLenSteps) % loopLenSteps
+        deltaSteps = stepNorm - nowNorm
+        if (deltaSteps < 0) deltaSteps += loopLenSteps
+      } else {
+        deltaSteps = step - nowStep
+        deltaSteps = ((deltaSteps % totalSteps) + totalSteps) % totalSteps
+      }
+      let when = ctx.currentTime + deltaSteps * secondsPerStep(tempo, spb)
       if (forceStart && first) when = Math.max(ctx.currentTime + 0.02, when)
       if (when > endTime) break
+      // protect against scheduling in the past due to jitter
+      if (when < ctx.currentTime - 0.002) { schedRef.current.nextStep = step + 1; first = false; continue }
       // ensure context is running (no await inside rAF loop)
       try { if (audioCtxRef.current && audioCtxRef.current.state !== 'running') audioCtxRef.current.resume().catch(()=>{}) } catch {}
       const total = song.bars * song.stepsPerBar
@@ -613,8 +993,12 @@ export default function Sequencer({ socket, onBack }) {
           osc.connect(g); g.connect(masterRef.current); osc.start(when); osc.stop(when + 0.1)
         }
       }
-      const inCountIn = countInRef.current.active && (step < countInRef.current.endStep)
-      const stepMod = step % total
+      const inCountIn = false
+      // For loop scheduling, map step to loop-relative modulo when active
+      const effOn3 = independentPattern ? localLoopOn : loopOn
+      const effStart3 = independentPattern ? localLoopStartStep : loopStartStep
+      const effEnd3 = independentPattern ? localLoopEndStep : loopEndStep
+      const stepMod = (effOn3 && effEnd3 > effStart3) ? ((step - effStart3) % (effEnd3 - effStart3) + (effEnd3 - effStart3)) % (effEnd3 - effStart3) + effStart3 : (step % total)
       const haveClips = Array.isArray(song.clips) && song.clips.length > 0
       if (haveClips) {
         for (const c of (song.clips || [])) {
@@ -657,7 +1041,9 @@ export default function Sequencer({ socket, onBack }) {
         const sIdx = ((s.startStep % total) + total) % total
         if (sIdx === stepMod && s.url) scheduleSfx(when, s)
       }
-      schedRef.current.nextStep = step + 1
+      let next = step + 1
+      if (effOn3 && effEnd3 > effStart3 && next >= effEnd3) next = effStart3
+      schedRef.current.nextStep = next
       first = false
     }
   }
@@ -668,10 +1054,32 @@ export default function Sequencer({ socket, onBack }) {
       try {
         // schedule audio
         if (playing) scheduleWindow()
-        // move markers
-        const logicalSteps = (currentBarsVis() * song.stepsPerBar)
-        const pxPattern = Math.round(logicalSteps * stepWPattern)
-        const pxArr = Math.round(logicalSteps * stepWArr)
+        // move markers with smooth sub-step motion
+        const spb = Math.max(1, song.stepsPerBar || 16)
+        const logicalStepsFloat = currentBarsVis() * spb
+        const globalStep = logicalStepsFloat // keep fractional for smoothness
+        let patStepFloat = globalStep
+        try {
+          const firstSel = Array.from(selectedClipIds || [])[0]
+          const selClip = (song.clips || []).find(c => c.id === firstSel)
+          const barsEff = (activePattern && activePattern.bars) ? activePattern.bars : (patternBars || 4)
+          const patSteps = Math.max(1, Math.round(barsEff) * spb)
+          if (selClip && patSteps > 0) {
+            const anchor = ((selClip.startStep % patSteps) + patSteps) % patSteps
+            const rel = globalStep - anchor
+            patStepFloat = ((rel % patSteps) + patSteps) % patSteps
+          } else if (patSteps > 0) {
+            patStepFloat = ((globalStep % patSteps) + patSteps) % patSteps
+          }
+        } catch {}
+        const targetPatPx = patStepFloat * stepWPattern
+        const targetArrPx = globalStep * stepWArr
+        // simple exponential smoothing to reduce jitter
+        const alpha = 0.35
+        patMarkerPxRef.current = patMarkerPxRef.current + (targetPatPx - patMarkerPxRef.current) * alpha
+        arrMarkerPxRef.current = arrMarkerPxRef.current + (targetArrPx - arrMarkerPxRef.current) * alpha
+        const pxPattern = patMarkerPxRef.current
+        const pxArr = arrMarkerPxRef.current
         if (rulerMarkerRef.current) {
           // Ruler is scaled to arrangement
           rulerMarkerRef.current.style.transform = `translateX(${pxArr}px)`
@@ -689,6 +1097,94 @@ export default function Sequencer({ socket, onBack }) {
           arrRulerMarkerRef.current.style.transform = `translateX(${pxArr}px)`
           arrRulerMarkerRef.current.style.opacity = (mode === 'arrangement' || playing) ? '1' : '0'
         }
+        // Smooth compose caret during holds (map absolute caret to pattern-local X)
+        if (composeOn && composeCaretRef.current) {
+          const spaceHeld = !!composeDownRef.current.get('Space')
+          const compClip = (song?.clips||[]).find(c => c.id === composeClipId)
+          const patIdForCaret = compClip?.patternId || activePatternId
+          const patForCaret = (song?.patterns||[]).find(p=>p.id===patIdForCaret) || activePattern
+          const patStepsForCaret = Math.max(1, (patForCaret?.bars||patternBars||4)*spb)
+          const anchorForCaret = compClip ? (((compClip.startStep % patStepsForCaret) + patStepsForCaret) % patStepsForCaret) : 0
+          function absToLocalX(absStep) {
+            const local = ((absStep - anchorForCaret) % patStepsForCaret + patStepsForCaret) % patStepsForCaret
+            return Math.round(local*STEP_UNIT*zoomX)
+          }
+          if ((chordActiveKeysRef.current.size>0 || spaceHeld) && chordStartTsRef.current) {
+            const stepProg = (performance.now() - chordStartTsRef.current) / (60000/tempo*4/spb)
+            const caretAbs = chordStartStepRef.current + Math.max(0, stepProg)
+            composeCaretRef.current.style.left = absToLocalX(caretAbs)+'px'
+            composeLiveStepRef.current = caretAbs
+          } else {
+            composeCaretRef.current.style.left = absToLocalX(composeStep)+'px'
+          }
+        }
+        // Compose preview playback of placed notes while caret advances (transport stopped)
+        if (composeOn && !playing) {
+          const spaceHeld = !!composeDownRef.current.get('Space')
+          const holding = (chordActiveKeysRef.current.size>0 || spaceHeld) && chordStartTsRef.current
+          if (holding) {
+            const caretStepFloat = chordStartStepRef.current + Math.max(0, (performance.now() - chordStartTsRef.current) / (60000/tempo*4/spb))
+            const prev = composePrevPlayedRef.current
+            const stepStart = Math.floor(caretStepFloatPrevRef.current || caretStepFloat)
+            const stepEnd = Math.floor(caretStepFloat)
+            if (!Number.isFinite(caretStepFloatPrevRef.current)) caretStepFloatPrevRef.current = caretStepFloat
+            if (stepEnd >= stepStart) {
+              const totalSteps = song.bars * spb
+              const stepRange = []
+              for (let s = stepStart; s <= stepEnd; s++) stepRange.push(s)
+              const notesPlay = []
+              const patternsById = new Map((song.patterns||[]).map(p=>[p.id,p]))
+              for (const c of (song.clips||[])) {
+                const pat = patternsById.get(c.patternId)
+                if (!pat) continue
+                const patSteps = Math.max(1, (pat.bars||1)*spb)
+                for (const ns of (pat.notes||[])) {
+                  // iterate pattern repeats within the clip window
+                  const baseLocal = ((ns.startStep % patSteps) + patSteps) % patSteps
+                  // find first k such that absStart >= clip.startStep
+                  const firstK = Math.ceil((c.startStep - (c.startStep + baseLocal)) / patSteps)
+                  const lastK = Math.floor(((c.startStep + c.lengthSteps - 1) - (c.startStep + baseLocal)) / patSteps)
+                  for (let k = firstK; k <= lastK; k++) {
+                    const absStart = c.startStep + baseLocal + k*patSteps
+                    // trigger if the caret crossed the integer step of this note's absolute start
+                    if (stepRange.includes(Math.floor(absStart))) {
+                      const key = `${c.id}:${ns.id}:${absStart}`
+                      if (!prev.has(key)) {
+                        prev.add(key)
+                        notesPlay.push({ pitch: ns.pitch, velocity: ns.velocity||0.8, lengthSteps: ns.lengthSteps||1, synth: ns.synth||'Triangle' })
+                      }
+                    }
+                  }
+                }
+              }
+              // play collected notes now
+              for (const it of notesPlay) {
+                const durSec = (it.lengthSteps/spb) * secondsPerBar(tempo)
+                playNote(audioCtxRef.current?.currentTime || 0, it.pitch, it.velocity, durSec, it.synth)
+              }
+            }
+            caretStepFloatPrevRef.current = caretStepFloat
+          } else {
+            // reset preview tracking and stop any preview voices
+            composePrevPlayedRef.current.clear()
+            for (const [m,o] of Array.from(composeVoicesRef.current.entries())) { try { o.g?.gain?.exponentialRampToValueAtTime(0.0001, (audioCtxRef.current?.currentTime||0)+0.02); o.osc?.stop?.((audioCtxRef.current?.currentTime||0)+0.04) } catch {} }
+            composeVoicesRef.current.clear()
+            caretStepFloatPrevRef.current = NaN
+          }
+        }
+        // Smooth ghost width updates without re-render
+        if (composeOn && composeDownRef.current && composeGhostRefsRef.current) {
+          const spb2 = Math.max(1, song.stepsPerBar || 16)
+          const msPerStep2 = (60000/tempo)*4/spb2
+          const now2 = performance.now()
+          for (const [k, rec] of Array.from(composeDownRef.current.entries())) {
+            if (k === 'Space') continue
+            const el = composeGhostRefsRef.current[k]
+            if (!el || !rec || !rec.tsMs) continue
+            const heldStepsFloat = Math.max(0, (now2 - rec.tsMs) / msPerStep2)
+            el.style.width = Math.max(1, Math.round(heldStepsFloat*STEP_UNIT*zoomX)) + 'px'
+          }
+        }
       } catch {}
       rafRef.current = requestAnimationFrame(frame)
     }
@@ -703,12 +1199,333 @@ export default function Sequencer({ socket, onBack }) {
     return () => window.removeEventListener('pointerdown', prime)
   }, [])
 
+  // Reset playhead markers precisely on play/seek to avoid initial offset
+  useEffect(() => {
+    try {
+      if (!song) return
+      const spb = Math.max(1, song.stepsPerBar || 16)
+      const globalStep = Math.max(0, currentBarsVis() * spb)
+      // arrangement marker
+      arrMarkerPxRef.current = globalStep * (STEP_UNIT * zoomX * ARR_SCALE)
+      // pattern marker anchored to selected or compose clip
+      const firstSel = Array.from(selectedClipIds || [])[0]
+      const sel = (song.clips || []).find(c => c.id === firstSel) || (song.clips || []).find(c => c.id === composeClipId) || null
+      const barsEff = (activePattern && activePattern.bars) ? activePattern.bars : (patternBars || 4)
+      const patSteps = Math.max(1, Math.round(barsEff) * spb)
+      let patStepFloat = ((globalStep % patSteps) + patSteps) % patSteps
+      if (sel) {
+        const anchor = ((sel.startStep % patSteps) + patSteps) % patSteps
+        const rel = globalStep - anchor
+        patStepFloat = ((rel % patSteps) + patSteps) % patSteps
+      }
+      patMarkerPxRef.current = patStepFloat * (STEP_UNIT * zoomX)
+      // apply immediately
+      if (gridMarkerRef.current) gridMarkerRef.current.style.transform = `translateX(${patMarkerPxRef.current}px)`
+      if (arrMarkerRef.current) arrMarkerRef.current.style.transform = `translateX(${arrMarkerPxRef.current}px)`
+      if (arrRulerMarkerRef.current) arrRulerMarkerRef.current.style.transform = `translateX(${arrMarkerPxRef.current}px)`
+    } catch {}
+  }, [playing, baseBar, baseTsMs, song, zoomX, selectedClipIds, composeClipId])
+
+  // Warm up common soundfont instruments in background (non-blocking)
+  useEffect(() => { (async ()=>{ try {
+    await Promise.all([
+      ensureSoundfontInstrument('acoustic_grand_piano'),
+      ensureSoundfontInstrument('string_ensemble_1'),
+      ensureSoundfontInstrument('electric_piano_1'),
+      ensureSoundfontInstrument('choir_aahs'),
+      ensureSoundfontInstrument('acoustic_bass')
+    ])
+  } catch {} })() }, [])
+
+  // Proactively warm instruments used in the song and current selection
+  useEffect(() => {
+    try {
+      const needed = new Set()
+      if (isSfSynth(synth)) needed.add(sfInstrFromSynthName(synth))
+      const pats = Array.isArray(song?.patterns) ? song.patterns : []
+      for (const p of pats) {
+        for (const n of (p?.notes||[])) {
+          if (isSfSynth(n.synth)) needed.add(sfInstrFromSynthName(n.synth))
+        }
+      }
+      for (const n of (song?.notes||[])) {
+        if (isSfSynth(n.synth)) needed.add(sfInstrFromSynthName(n.synth))
+      }
+      for (const name of Array.from(needed)) { try { ensureSoundfontInstrument(name) } catch {} }
+    } catch {}
+  }, [song, synth])
+
+  // Instrument + Compose key handlers
+  useEffect(() => {
+    function midiForKey(code) {
+      // QWERTY layout mapping (two rows). Base octave = C4 (60) + 12*instOct
+      // Z-row (lower octave): Z S X D C V G B H N J M -> C, C#, D, D#, E, F, F#, G, G#, A, A#, B (offset 0..11)
+      // Q-row (upper octave): Q 2 W 3 E R 5 T 6 Y 7 U -> C, C#, D, D#, E, F, F#, G, G#, A, A#, B (+12)
+      const base = 60 + instOct*12
+      const offsets = {
+        KeyZ:0, KeyS:1, KeyX:2, KeyD:3, KeyC:4, KeyV:5, KeyG:6, KeyB:7, KeyH:8, KeyN:9, KeyJ:10, KeyM:11,
+        KeyQ:12, Digit2:13, KeyW:14, Digit3:15, KeyE:16, KeyR:17, Digit5:18, KeyT:19, Digit6:20, KeyY:21, Digit7:22, KeyU:23
+      }
+      if (offsets[code] !== undefined) return base + offsets[code]
+      return null
+    }
+    function noteOn(midi) {
+      try {
+        ensureAudio(); const ctx = audioCtxRef.current; const master = masterRef.current
+        if (!ctx || !master) return
+        const v = Math.max(0.05, Math.min(1, instVel/10))
+        if (isSfSynth(synth)) {
+          try { ensureSoundfontInstrument(sfInstrFromSynthName(synth) || 'acoustic_grand_piano') } catch {}
+          // soundfont preview
+          const node = playSf(midi, ctx.currentTime, 2.0, v, sfInstrFromSynthName(synth) || 'acoustic_grand_piano')
+          heldOscs.set(midi, { sf: node })
+          heldOscsRef.current.set(midi, { sf: node })
+        } else {
+          const freq = 440 * Math.pow(2, (midi - 69) / 12)
+          const osc = ctx.createOscillator(); const g = ctx.createGain()
+          osc.type = (synth||'Triangle').toLowerCase(); osc.frequency.setValueAtTime(freq, ctx.currentTime)
+          g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.linearRampToValueAtTime(v, ctx.currentTime + 0.005)
+          osc.connect(g); g.connect(master)
+          osc.start();
+          // store in refs to ensure visibility from all handlers
+          heldOscs.set(midi, { osc, g })
+          heldOscsRef.current.set(midi, { osc, g })
+        }
+      } catch {}
+    }
+    function noteOff(midi) {
+      try {
+        const ctx = audioCtxRef.current;
+        const o = heldOscs.get(midi) || heldOscsRef.current.get(midi)
+        if (!o || !ctx) return
+        if (o.sf) {
+          stopSfNode(o.sf)
+        } else if (o.g && o.osc) {
+          o.g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.05)
+          o.osc.stop(ctx.currentTime + 0.08)
+        }
+        heldOscs.delete(midi); heldOscsRef.current.delete(midi)
+      } catch {}
+    }
+    const heldOscs = new Map()
+    function onDown(e) {
+      const tag = (e.target&&e.target.tagName)||''; if (tag==='INPUT'||tag==='TEXTAREA') return
+      if (e.code==='KeyI') { e.preventDefault(); ensureAudio(); setInstOn(v=>!v); return }
+      if (e.code==='KeyR') { e.preventDefault();
+        setComposeOn(v => {
+          const next = !v
+          if (next) {
+            const spb = song?.stepsPerBar || 16
+            const start = Math.max(0, Math.floor(currentBarsVis() * spb))
+            setComposeStep(start)
+            chordStartStepRef.current = start
+            chordStartTsRef.current = 0
+            // Prefer selected clip if any
+            let clip = null
+            const selId = (selectedClipIds && selectedClipIds.size>0) ? Array.from(selectedClipIds)[0] : null
+            if (selId) clip = (song?.clips||[]).find(c => c.id === selId) || null
+            // Else pick clip under caret step, choosing nearest track to lastArrTrackRef
+            if (!clip) {
+              const clipsAtStep = (song?.clips||[]).filter(c => start>=c.startStep && start < (c.startStep+c.lengthSteps))
+              if (clipsAtStep.length) {
+                const prefTrack = Number.isFinite(lastArrTrackRef.current) ? lastArrTrackRef.current : 0
+                clip = clipsAtStep.reduce((a,b)=> (Math.abs((a?.track??0)-prefTrack) <= Math.abs((b?.track??0)-prefTrack) ? a : b))
+              }
+            }
+            if (!clip) {
+              const id = Date.now().toString(36)+Math.random().toString(36).slice(2)
+              const trackPref = Number.isFinite(lastArrTrackRef.current) ? lastArrTrackRef.current : 0
+              clip = { id, track: Math.max(0, Math.min(ARR_TRACKS-1, trackPref)), startStep: start, lengthSteps: Math.max(spb/2, 4), patternId: (song?.activePatternId||'p1') }
+              setSong(prev => prev ? { ...prev, clips: [...(prev.clips||[]), clip] } : prev)
+              try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'clip_add', ...clip }] }) } catch {}
+            }
+            setComposeClipId(clip.id)
+            // force a small rerender to ensure ghosts show on first keydown
+            setComposeGhostTick(t=>t+1)
+          } else {
+            composeDownRef.current.clear()
+          }
+          return next
+        })
+        return }
+      if (composeOn) {
+        const now = performance.now()
+        if (e.code==='Space') { e.preventDefault();
+          if (chordActiveKeysRef.current.size === 0 && !composeDownRef.current.has('Space')) {
+            chordStartStepRef.current = Math.round((composeLiveStepRef.current||composeStep))
+            chordStartTsRef.current = now
+            setComposeGhostTick(t=>t+1)
+          }
+          composeDownRef.current.set('Space', { tsMs: now });
+          return }
+        const midi = midiForKey(e.code)
+        if (midi!==null && !composeDownRef.current.has(e.code)) {
+          // compute absolute start step at the moment this key is pressed
+          const spb = song?.stepsPerBar || 16
+          const msPerBeat = 60000/tempo; const msPerBar = msPerBeat*4; const msPerStep = msPerBar/spb
+          const spaceHeld = !!composeDownRef.current.get('Space')
+          let startStepAbs
+          if ((chordActiveKeysRef.current.size === 0 && !spaceHeld) || !chordStartTsRef.current) {
+            // first key (and no space anchor): anchor at current caret (no elapsed yet)
+            startStepAbs = Math.round((composeLiveStepRef.current||composeStep))
+          } else {
+            const elapsedSteps = Math.max(0, Math.floor((now - chordStartTsRef.current) / msPerStep))
+            startStepAbs = (chordStartStepRef.current||composeStep) + elapsedSteps
+          }
+          composeDownRef.current.set(e.code, { tsMs: now, midi, vel: Math.max(0.05, Math.min(1, instVel/10)), startStepAbs })
+          if (instOn && !heldKeysRef.current.has(e.code)) { heldKeysRef.current.add(e.code); noteOn(midi) }
+          // chord start tracking
+          chordActiveKeysRef.current.add(e.code)
+          // anchor caret on first key only if Space is not serving as anchor
+          if (chordActiveKeysRef.current.size === 1 && !composeDownRef.current.get('Space')) {
+            chordStartStepRef.current = Math.round((composeLiveStepRef.current||composeStep))
+            chordStartTsRef.current = now
+          }
+          setComposeGhostTick(t=>t+1)
+          e.preventDefault(); return
+        }
+      }
+      // Instrument playback only when Instrument mode is ON
+      if (!instOn) return
+      if (typingOn) return
+      // prevent transport space in inst mode
+      if (e.code==='Space') { e.preventDefault(); return }
+      if (e.code=== 'Comma') { e.preventDefault(); setInstOct(o=>Math.max(-3, o-1)); return }
+      if (e.code=== 'Period') { e.preventDefault(); setInstOct(o=>Math.min(3, o+1)); return }
+      if (/^Digit[1-9]$/.test(e.code)) { e.preventDefault(); setInstVel(Number(e.code.slice(5))); return }
+      const midi = midiForKey(e.code)
+      if (midi!==null && !heldKeysRef.current.has(e.code)) { heldKeysRef.current.add(e.code); noteOn(midi) }
+    }
+    function onUp(e) {
+      if (composeOn) {
+        const spb = song?.stepsPerBar || 16
+        const now = performance.now()
+        if (e.code==='Space') {
+          const rec = composeDownRef.current.get('Space'); composeDownRef.current.delete('Space')
+          // Prefer the live rAF-updated position for exact final caret
+          let caretAtRelease = Math.floor(composeLiveStepRef.current || (chordStartStepRef.current||composeStep))
+          setComposeStep(caretAtRelease)
+          // Also pin yellow transport caret to this position for visual consistency
+          const barsAtRelease = (caretAtRelease / (song?.stepsPerBar || 16))
+          setBaseBar(barsAtRelease)
+          setBaseTsMs(Date.now())
+          schedRef.current.nextStep = Math.floor(barsAtRelease * (song?.stepsPerBar || 16))
+          chordStartStepRef.current = caretAtRelease
+          chordStartTsRef.current = 0
+          setComposeGhostTick(t=>t+1)
+          e.preventDefault(); return
+        }
+        const m = midiForKey(e.code)
+        const rec = composeDownRef.current.get(e.code)
+        if (m!==null && rec) {
+          composeDownRef.current.delete(e.code)
+          // Stop live preview if Instrument is on
+          if (instOn && heldKeysRef.current.has(e.code)) { heldKeysRef.current.delete(e.code); noteOff(m) }
+          const msPerBeat = 60000/tempo; const msPerBar = msPerBeat*4; const msPerStep = msPerBar/spb
+          let steps = Math.max(1, Math.round((now - rec.tsMs)/msPerStep))
+          chordActiveKeysRef.current.delete(e.code)
+          chordMaxStepsRef.current = Math.max(chordMaxStepsRef.current||0, steps)
+          const clip = (song?.clips||[]).find(c=>c.id===composeClipId)
+          if (clip) {
+            const patId = clip.patternId || activePatternId
+            const pat = (song?.patterns||[]).find(p=>p.id===patId) || activePattern
+            const patSteps = Math.max(1, (pat?.bars||patternBars||4)*spb)
+            const anchor = ((clip.startStep % patSteps) + patSteps) % patSteps
+            const absStart = Number.isFinite(rec.startStepAbs) ? rec.startStepAbs : chordStartStepRef.current
+            // place within the clip window, not modulo pattern: clamp to clip length
+            const withinAbs = Math.max(0, absStart - clip.startStep)
+            const localStart = (((clip.startStep + withinAbs) - anchor) % patSteps + patSteps) % patSteps
+            let ops = []
+            // extend pattern if needed
+            const needed = localStart + steps
+            if (needed > patSteps) {
+              const newBars = Math.max(pat?.bars||1, Math.ceil(needed / spb))
+              ops.push({ type:'pattern_update', id: patId, bars: newBars })
+              setSong(prev => prev ? { ...prev, patterns: (prev.patterns||[]).map(p=> p.id===patId?{...p, bars:newBars}:p) } : prev)
+            }
+            // extend clip if needed
+            const withinChord = (chordStartStepRef.current - clip.startStep)
+            const needClipLen = withinChord + steps
+            if (needClipLen > clip.lengthSteps) {
+              ops.push({ type:'clip_update', id: clip.id, lengthSteps: needClipLen })
+              setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).map(c=> c.id===clip.id?{...c, lengthSteps: needClipLen}:c) } : prev)
+            }
+            // commit note
+            const id = Date.now().toString(36)+Math.random().toString(36).slice(2)
+            ops.push({ type:'note_add', id, pitch: wrapPitchToVisible(m), startStep: localStart, lengthSteps: steps, velocity: rec.vel||0.8, synth, patternId: patId })
+            try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops }) } catch {}
+            // When last key releases, advance pointer only if Space is NOT held
+            if (chordActiveKeysRef.current.size === 0) {
+              const adv = chordMaxStepsRef.current || steps
+              chordMaxStepsRef.current = 0
+              if (!composeDownRef.current.get('Space')) {
+                setComposeStep(chordStartStepRef.current + adv)
+                chordStartStepRef.current = composeStep + adv
+                chordStartTsRef.current = 0
+              }
+              // If Space is held, do not change anchors; caret continues smoothly
+            }
+            setComposeGhostTick(t=>t+1)
+          }
+          e.preventDefault(); return
+        }
+      }
+      if (!instOn) return
+      const midi = midiForKey(e.code)
+      if (midi!==null) { heldKeysRef.current.delete(e.code); noteOff(midi) }
+      if (e.code==='Escape') { setInstOn(false); setComposeOn(false) }
+    }
+    function onGlobalBlur() {
+      for (const k of Array.from(heldKeysRef.current)) {
+        const m = midiForKey(k); if (m!==null) { heldKeysRef.current.delete(k); noteOff(m) }
+      }
+      // hard stop any remaining oscs
+      try {
+        const ctx = audioCtxRef.current
+        for (const [m, o] of Array.from(heldOscsRef.current.entries())) {
+          if (!o || !ctx) continue
+          o.g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.02)
+          o.osc.stop(ctx.currentTime + 0.04)
+          heldOscsRef.current.delete(m)
+        }
+      } catch {}
+    }
+    window.addEventListener('keydown', onDown)
+    window.addEventListener('keyup', onUp)
+    window.addEventListener('blur', onGlobalBlur)
+    return () => { window.removeEventListener('keydown', onDown); window.removeEventListener('keyup', onUp); window.removeEventListener('blur', onGlobalBlur) }
+  }, [instOn, instOct, instVel, synth, typingOn, composeOn, song])
+
   // Keyboard + group operations
   useEffect(() => {
     function onKey(e) {
       const tag = (e.target && e.target.tagName) || ''
       if (tag === 'INPUT' || tag === 'TEXTAREA' || e.isComposing) return
-      if (typingOn && e.code === 'Space') { e.preventDefault(); return }
+      if ((typingOn || composeOn) && e.code === 'Space') { e.preventDefault(); return }
+      if (e.code === 'KeyL') {
+        e.preventDefault()
+        if (independentPattern) {
+          setLocalLoopOn(v => {
+            const next = !v
+            if (next && song) {
+              const spb = song.stepsPerBar
+              const pos = Math.floor(currentBarsVis() * spb)
+              setLocalLoopStartStep(pos)
+              setLocalLoopEndStep(Math.min(pos + spb*2, song.bars*spb))
+            }
+            return next
+          })
+        } else {
+          const spb = song.stepsPerBar
+          const pos = Math.floor(currentBarsVis() * spb)
+          const on = !loopOn
+          const start = on ? pos : loopStartStep
+          const end = on ? Math.min(pos + spb*2, song.bars*spb) : loopEndStep
+          setLoopOn(on); setLoopStartStep(start); setLoopEndStep(end)
+          try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on, startStep: start, endStep: end }] }) } catch {}
+        }
+        return
+      }
       if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') {
         // Copy selected notes to clipboardRef
         const sel = Array.from(selectedIds || [])
@@ -778,7 +1595,62 @@ export default function Sequencer({ socket, onBack }) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [playing, selectedId, selectedIds, rev, songId, song, typingOn])
+  }, [playing, selectedId, selectedIds, rev, songId, song, typingOn, composeOn])
+
+  // Helper to get effective loop values (respects Independent mode)
+  const effLoopOn = independentPattern ? localLoopOn : loopOn
+  const effLoopStart = independentPattern ? localLoopStartStep : loopStartStep
+  const effLoopEnd = independentPattern ? localLoopEndStep : loopEndStep
+
+  // Global key for pattern-from-loop (P = toggle preview, Enter = create, Esc = cancel)
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.repeat) return
+      if (e.code === 'KeyP') {
+        e.preventDefault()
+        if (!song) return
+        if (!(effLoopOn && effLoopEnd > effLoopStart)) return
+        // Choose track: selected clip -> its track; else last hovered; else 0
+        let t = 0
+        const firstSel = Array.from(selectedClipIds || [])[0]
+        const selClip = (song.clips||[]).find(c=>c.id===firstSel)
+        if (selClip) t = selClip.track
+        else if (Number.isFinite(loopTrackRef.current)) t = Math.max(0, Math.min(ARR_TRACKS-1, Number(loopTrackRef.current)))
+        else if (Number.isFinite(lastArrTrackRef.current)) t = Math.max(0, Math.min(ARR_TRACKS-1, Number(lastArrTrackRef.current)))
+        setLoopMakeTrack(t)
+        setLoopMakeOn(true)
+        return
+      }
+      if (!loopMakeOn) return
+      if (e.code === 'Escape') { e.preventDefault(); setLoopMakeOn(false); return }
+      if (e.code === 'Enter') {
+        e.preventDefault()
+        if (!song) return
+        if (!(effLoopOn && effLoopEnd > effLoopStart)) { setLoopMakeOn(false); return }
+        const spb = song.stepsPerBar
+        const start = Math.max(0, Math.min(song.bars*spb-1, effLoopStart))
+        const end = Math.max(start+1, Math.min(song.bars*spb, effLoopEnd))
+        const len = end - start
+        // Prevent overlap on chosen track
+        const bad = (song.clips||[]).some(c => c.track===loopMakeTrack && !(end <= c.startStep || start >= (c.startStep + c.lengthSteps)))
+        if (bad) return
+        const bars = Math.max(1, Math.round(len / spb))
+        const pid = 'p'+Date.now().toString(36)+Math.random().toString(36).slice(2)
+        const ops = [
+          { type:'pattern_add', id: pid, name: 'Pattern '+((song.patterns||[]).length+1), bars },
+          { type:'clip_add', id: Date.now().toString(36)+Math.random().toString(36).slice(2), track: loopMakeTrack, startStep: start, lengthSteps: len, patternId: pid },
+        ]
+        // Focus pattern
+        if (!independentPattern) ops.push({ type:'pattern_select', id: pid })
+        setLoopMakeOn(false)
+        try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops }) } catch {}
+        if (independentPattern) setLocalPatternId(pid)
+        return
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [song, effLoopOn, effLoopStart, effLoopEnd, loopMakeOn, loopMakeTrack, rev, independentPattern, selectedClipIds])
 
   function handlePlay() {
     ensureAudio(); try { audioCtxRef.current?.resume?.() } catch {}
@@ -786,12 +1658,12 @@ export default function Sequencer({ socket, onBack }) {
     setPlaying(true); setBaseBar(nowBars); setBaseTsMs(Date.now())
     if (countInOn) { countInRef.current = { active: true, endStep: Math.floor((nowBars + 1) * (song?.stepsPerBar || 16)) } } else { countInRef.current.active = false }
     try { scheduleWindow(true) } catch {}
-    try { socket?.emit?.('seq_transport', { songId, playing: true, positionBars: nowBars, tempo }) } catch {}
+    try { socket?.emit?.('seq_transport', { songId, playing: true, positionBars: nowBars, tempo, shared: !independentPattern }) } catch {}
   }
   function handleStop() {
     setPlaying(false)
     countInRef.current.active = false
-    try { socket?.emit?.('seq_transport', { songId, playing: false, positionBars: currentBarsRaw(), tempo }) } catch {}
+    try { socket?.emit?.('seq_transport', { songId, playing: false, positionBars: currentBarsRaw(), tempo, shared: !independentPattern }) } catch {}
   }
 
   // Add a note (optimistic), default length 4 steps
@@ -850,7 +1722,7 @@ export default function Sequencer({ socket, onBack }) {
       for (const n of (p.notes||[])) {
         const x = Math.round(n.startStep * scale)
         const w = Math.max(1, Math.round(n.lengthSteps * scale))
-        const color = (PREVIEW_COLOR && PREVIEW_COLOR[n.synth]) || 'rgba(255,255,255,0.45)'
+        const color = (typeof n.synth === 'string' && n.synth.startsWith('SF:')) ? sfPreviewFor(n.synth.slice(3)) : ((PREVIEW_COLOR && PREVIEW_COLOR[n.synth]) || 'rgba(255,255,255,0.45)')
         ctx.fillStyle = color
         const pitch = Math.max(pmin, Math.min(pmax, Number(n.pitch)||60))
         // Map highest pitch to top
@@ -889,7 +1761,7 @@ export default function Sequencer({ socket, onBack }) {
     )
   }
 
-  const activePatternId = song?.activePatternId || (song?.patterns && song.patterns[0]?.id) || 'p1'
+  const activePatternId = independentPattern ? (localPatternId || song?.activePatternId || (song?.patterns && song.patterns[0]?.id) || 'p1') : (song?.activePatternId || (song?.patterns && song.patterns[0]?.id) || 'p1')
   const activePattern = (song?.patterns || []).find(p => p.id === activePatternId)
   const notesForEditor = activePattern ? (activePattern.notes || []) : (song.notes || [])
   const patternBarsEff = activePattern ? activePattern.bars : (patternBars || 4)
@@ -897,18 +1769,24 @@ export default function Sequencer({ socket, onBack }) {
   const arrSteps = song.bars * song.stepsPerBar
   
   return (
-    <div ref={rootRef} className="w-full h-full bg-black text-white relative">
+    <div ref={rootRef} className="w-full h-full bg-black text-white relative" onContextMenu={(e)=>{ e.preventDefault(); e.stopPropagation(); }}>
       <div className="absolute top-3 left-3 z-50 flex items-center gap-2">
         <button className="px-3 py-1 rounded bg-white/10 hover:bg-white/20 text-xs" onClick={onBack}>Back</button>
         <button className="px-3 py-1 rounded bg-white/10 hover:bg-white/20 text-xs" onClick={handlePlay}>Play</button>
         <button className="px-3 py-1 rounded bg-white/10 hover:bg-white/20 text-xs" onClick={handleStop}>Stop</button>
         <div className="px-2 py-1 text-xs bg-white/5 rounded">Tempo {tempo}</div>
         <div className="flex items-center gap-1 text-xs">
-          <span>Mode</span>
-          <select className="bg-black/40 border border-white/10 rounded px-1 py-0.5 text-white" value={mode} onChange={(e)=> setMode(e.target.value)}>
-            <option value="pattern">Pattern</option>
-            <option value="arrangement">Arrangement</option>
-          </select>
+          <label className="ml-2 flex items-center gap-1 cursor-pointer select-none">
+            <input type="checkbox" checked={linkClipToPattern} onChange={(e)=> setLinkClipToPattern(e.target.checked)} />
+            <span>Link clip selection → pattern</span>
+          </label>
+          <div className={instOn?"px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/40 text-emerald-200 text-xs":"px-2 py-0.5 rounded bg-white/5 border border-white/10 text-zinc-300 text-xs"} title="I: toggle • ,/. octave • 1-9 velocity • Esc: exit">
+            {instOn ? `Instrument ON (${synth}) • Oct ${instOct>=0?`+${instOct}`:instOct} • Vel ${instVel}` : 'Press I: Instrument mode'}
+          </div>
+          {/* Compose HUD */}
+          <div className={composeOn?"px-2 py-0.5 rounded bg-sky-500/20 border border-sky-400/40 text-sky-200 text-xs":"px-2 py-0.5 rounded bg-white/5 border border-white/10 text-zinc-300 text-xs"} title="R: toggle compose • Space: rest • Esc: exit">
+            {composeOn ? `Compose ON • Step ${composeStep}` : 'R: Compose'}
+          </div>
         </div>
       </div>
       <div className="px-6 pt-16">
@@ -935,9 +1813,13 @@ export default function Sequencer({ socket, onBack }) {
           <div className="flex items-center gap-1">
             <span>Pattern</span>
             <select className="bg-black/40 border border-white/10 rounded px-1 py-0.5 text-white" value={activePatternId}
-                    onChange={(e)=>{ const id = e.target.value; try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'pattern_select', id }] }) } catch {} }}>
+                    onChange={(e)=>{ const id = e.target.value; if (independentPattern) { setLocalPatternId(id) } else { try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'pattern_select', id }] }) } catch {} } }}>
               {(song.patterns||[{id:'p1',name:'Pattern 1'}]).map(p => (<option key={p.id} value={p.id}>{p.name}</option>))}
             </select>
+            <label className="flex items-center gap-1 cursor-pointer select-none">
+              <input type="checkbox" checked={independentPattern} onChange={(e)=> { const on = e.target.checked; setIndependentPattern(on); if (on) { setLocalPatternId(activePatternId); setLocalLoopOn(!!loopOn); setLocalLoopStartStep(loopStartStep); setLocalLoopEndStep(loopEndStep) } }} />
+              <span>Independent</span>
+            </label>
             <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20"
                     onClick={()=>{ const id='p'+Date.now().toString(36)+Math.random().toString(36).slice(2); try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'pattern_add', id, name:'Pattern '+((song.patterns||[]).length+1), bars: 4 }] }) } catch {} }}>+ New</button>
             <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20"
@@ -950,14 +1832,38 @@ export default function Sequencer({ socket, onBack }) {
             <select className="bg-black/40 border border-white/10 rounded px-1 py-0.5 text-white" value={synth} onChange={(e)=> setSynth(e.target.value)}>
               {SYNTHS.map(s => (<option key={s} value={s}>{s}</option>))}
             </select>
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={()=> setSfPaletteOpen(v=>!v)}>More…</button>
+            {sfPaletteOpen && createPortal(
+              <div className="fixed top-16 right-4 z-[1000] w-[360px] max-h-[70vh] overflow-auto rounded border border-white/10 bg-black/90 p-2 shadow-lg" onMouseDown={(e)=> e.stopPropagation()}>
+                <div className="flex items-center gap-2 mb-2">
+                  <input className="w-full bg-black/40 border border-white/10 rounded px-2 py-1 text-white" placeholder="Search instruments…" value={sfQuery} onChange={(e)=> setSfQuery(e.target.value)} />
+                  <button className="px-2 py-1 rounded bg-white/10 hover:bg-white/20" onClick={()=> setSfPaletteOpen(false)}>Close</button>
+                </div>
+                <SfInstrumentList query={sfQuery} onPick={(inst)=> { setSynth('SF:'+inst); setSfPaletteOpen(false); try { ensureSoundfontInstrument(inst) } catch {} }} />
+              </div>, document.body)
+            }
+          </div>
+          <div className="flex items-center gap-1">
+            <span>Song</span>
+            <input className="w-36 bg-black/40 border border-white/10 rounded px-2 py-0.5 text-white" placeholder="id" value={songSaveId} onChange={(e)=> setSongSaveId(e.target.value)} />
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={()=> saveSongSnapshot(songSaveId)}>Save</button>
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={()=> loadSongSnapshot(songSaveId)}>Open</button>
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={()=> listSongs()}>List</button>
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={newSharedSong}>New</button>
+            {isAdmin && (
+              <button className="px-2 py-0.5 rounded bg-red-600/70 hover:bg-red-600/80" onClick={()=> deleteSong(songSaveId)}>Delete</button>
+            )}
+            {songsList && songsList.length>0 && (
+              <select className="bg-black/40 border border-white/10 rounded px-1 py-0.5 text-white" value={songSaveId} onChange={(e)=> { setSongSaveId(e.target.value) }}>
+                {songsList.map(id => (<option key={id} value={id}>{id}</option>))}
+              </select>
+            )}
           </div>
           <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={metronomeOn} onChange={(e)=> setMetronomeOn(e.target.checked)} /> Metronome</label>
           <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={countInOn} onChange={(e)=> setCountInOn(e.target.checked)} /> Count‑in</label>
           <div className="flex items-center gap-2">
             <span>Zoom H</span>
             <input type="range" min="0.5" max="2" step="0.1" value={zoomX} onChange={(e)=> setZoomX(Number(e.target.value))} />
-            <span>V</span>
-            <input type="range" min="0.5" max="2" step="0.1" value={zoomY} onChange={(e)=> setZoomY(Number(e.target.value))} />
           </div>
           <div className="opacity-70">Space: Play/Pause • Right‑click: Delete</div>
         </div>
@@ -981,46 +1887,105 @@ export default function Sequencer({ socket, onBack }) {
                                        repeating-linear-gradient(to right, rgba(255,255,255,0.04) 0, rgba(255,255,255,0.04) 1px, transparent 1px, transparent ${STEP_UNIT}px)`,
                      backgroundPosition: '0.5px 0px, 0.5px 0px, 0.5px 0px', backgroundRepeat: 'repeat' }}
             onMouseDown={(e) => {
+            e.preventDefault(); e.stopPropagation()
             const rect = e.currentTarget.getBoundingClientRect()
               const x = (e.clientX - rect.left)
-              const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor(x / (stepWArr))))
+              const sc = rulerScrollRef.current?.scrollLeft || 0
+              // account for 0.5px background offset and device pixel rounding
+              const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor((sc + x - 0.5) / (stepWArr))))
               const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
+            if (e.altKey) {
+              loopDragRef.current = { active: true, start: step }
+              if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(step); setLocalLoopEndStep(step) }
+              else {
+                setLoopOn(true); setLoopStartStep(step); setLoopEndStep(step)
+                try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: step, endStep: step }] }) } catch {}
+              }
+              return
+            }
+            // Click to set compose caret on the pattern timeline as well
+            if (!e.altKey) {
+              const spaceHeld = !!composeDownRef.current.get('Space')
+              if (spaceHeld) {
+                chordStartStepRef.current = step
+                chordStartTsRef.current = performance.now()
+                composeLiveStepRef.current = step
+              } else {
+                setComposeStep(step)
+                chordStartStepRef.current = step
+                chordStartTsRef.current = 0
+                composeLiveStepRef.current = step
+              }
+              caretStepFloatPrevRef.current = NaN
+              setComposeGhostTick(t=>t+1)
+            }
+            // Preserve existing transport scrubbing with Shift
             const bars = step / song.stepsPerBar
             const shouldPlay = e.shiftKey || playing
-            // local transport update
-            setBaseBar(bars)
-            setBaseTsMs(Date.now())
-            schedRef.current.nextStep = Math.floor(bars * song.stepsPerBar)
-            if (shouldPlay) {
-              setPlaying(true)
-              ensureAudio(); try { audioCtxRef.current?.resume?.() } catch {}
-              scheduleWindow(true)
-            } else {
-              setPlaying(false)
-            }
-            // Defer broadcast until mouse up to avoid spamming while scrubbing
+            setBaseBar(bars); setBaseTsMs(Date.now()); schedRef.current.nextStep = Math.floor(bars * song.stepsPerBar)
+            if (shouldPlay) { setPlaying(true); ensureAudio(); try { audioCtxRef.current?.resume?.() } catch {}; scheduleWindow(true) } else { setPlaying(false) }
             dragRef.current = { active: true, shift: shouldPlay }
             }}
             onMouseMove={(e) => {
-            if (!dragRef.current.active) return
             const rect = e.currentTarget.getBoundingClientRect()
               const x = (e.clientX - rect.left)
-              const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor(x / (stepWArr))))
-              const step = Math.max(0, Math.min(arrSteps-1, snapStep(rawStep)))
+              const sc = rulerScrollRef.current?.scrollLeft || 0
+              const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor((sc + x - 0.5) / (stepWArr))))
+              const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
+            if (loopDragRef.current.active || e.altKey) {
+              const a = Math.min(loopDragRef.current.start, step)
+              const b = Math.max(loopDragRef.current.start, step)
+              if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(a); setLocalLoopEndStep(b) }
+              else {
+                setLoopOn(true); setLoopStartStep(a); setLoopEndStep(b)
+                try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: a, endStep: b }] }) } catch {}
+              }
+              return
+            }
+            if (!dragRef.current.active) return
             const bars = step / song.stepsPerBar
             setBaseBar(bars); setBaseTsMs(Date.now())
             }}
             onMouseUp={(e) => {
             const rect = e.currentTarget.getBoundingClientRect()
               const x = (e.clientX - rect.left)
-              const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor(x / (stepWArr))))
-              const step = Math.max(0, Math.min(arrSteps-1, snapStep(rawStep)))
+              const sc = rulerScrollRef.current?.scrollLeft || 0
+              const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor((sc + x - 0.5) / (stepWArr))))
+              const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
+            if (loopDragRef.current.active) {
+              const a = Math.min(loopDragRef.current.start, step)
+              const b = Math.max(loopDragRef.current.start, step)
+              if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(a); setLocalLoopEndStep(b) }
+              else {
+                setLoopOn(true); setLoopStartStep(a); setLoopEndStep(b)
+                try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: a, endStep: b }] }) } catch {}
+              }
+              loopDragRef.current.active = false
+              return
+            }
+            // Also set compose caret/live position here for reliability (incl step 0)
+            if (!e.altKey) {
+              const spaceHeld = !!composeDownRef.current.get('Space')
+              if (spaceHeld) {
+                chordStartStepRef.current = step
+                chordStartTsRef.current = performance.now()
+                composeLiveStepRef.current = step
+              } else {
+                setComposeStep(step)
+                chordStartStepRef.current = step
+                chordStartTsRef.current = 0
+                composeLiveStepRef.current = step
+              }
+              caretStepFloatPrevRef.current = NaN
+              setComposeGhostTick(t=>t+1)
+            }
             const bars = step / song.stepsPerBar
-            try { socket?.emit?.('seq_transport', { songId, playing: dragRef.current.shift, positionBars: bars, tempo }) } catch {}
+            try { socket?.emit?.('seq_transport', { songId, playing: dragRef.current.shift, positionBars: bars, tempo, shared: !independentPattern }) } catch {}
             dragRef.current.active = false
             }}
             onMouseLeave={() => { dragRef.current.active = false }}
           >
+            {/* loop overlay hidden on pattern ruler per request */}
             {/* Current position marker */}
             <div ref={rulerMarkerRef} className="absolute top-0 h-full" style={{ transform: 'translateX(0px)', willChange: 'transform' }}>
               <div className="w-[1px] h-full bg-yellow-400" />
@@ -1090,50 +2055,123 @@ export default function Sequencer({ socket, onBack }) {
                                       repeating-linear-gradient(to bottom, rgba(255,255,255,0.10) 0, rgba(255,255,255,0.10) 1px, transparent 1px, transparent ${Math.round(ROW_UNIT*zoomY)*12}px)`,
                      backgroundPosition: '0.5px 0px, 0px 0.5px, 0px 0.5px' }}
             onMouseDown={(e) => {
-              if (mode === 'arrangement') return // pattern seek disabled in arrangement mode
+              // allow marquee selection in both modes
               // Start marquee only when holding Shift; plain click will place notes
-              if (e.button !== 0 || !e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return
+              if (e.button !== 0) return
+              if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) {
+                if (!e.shiftKey) return
+                e.preventDefault(); e.stopPropagation()
+                const host = e.currentTarget.getBoundingClientRect()
+                const x = (e.clientX - host.left)
+                const y = e.clientY - host.top
+                marqueeRef.current = { active: true, x0: x, y0: y, x1: x, y1: y }
+                setMarqueeBox({ x, y, w: 0, h: 0 })
+                const onMove = (ev) => {
+                  const xm = ev.clientX - host.left
+                  const ym = ev.clientY - host.top
+                  marqueeRef.current.x1 = xm; marqueeRef.current.y1 = ym
+                  const xMin = Math.min(marqueeRef.current.x0, xm)
+                  const yMin = Math.min(marqueeRef.current.y0, ym)
+                  const xMax = Math.max(marqueeRef.current.x0, xm)
+                  const yMax = Math.max(marqueeRef.current.y0, ym)
+                  setMarqueeBox({ x: xMin, y: yMin, w: xMax - xMin, h: yMax - yMin })
+                }
+                const onUp = () => {
+                  window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp)
+                  const box = marqueeRef.current; marqueeRef.current.active = false
+                  setMarqueeBox(null); suppressClickRef.current = true
+                  if (!song) return
+                  const xMin = Math.min(box.x0, box.x1), xMax = Math.max(box.x0, box.x1)
+                  const yMin = Math.min(box.y0, box.y1), yMax = Math.max(box.y0, box.y1)
+                  const stepMin = Math.floor(xMin / (STEP_UNIT*zoomX))
+                  const stepMax = Math.floor(xMax / (STEP_UNIT*zoomX))
+                  const rowMin = Math.floor(yMin / (ROW_UNIT*zoomY))
+                  const rowMax = Math.floor(yMax / (ROW_UNIT*zoomY))
+                  const pitchMin = PITCH_MAX - rowMax
+                  const pitchMax = PITCH_MAX - rowMin
+                  const sel = new Set()
+                  for (const n of (notesForEditor||[])) {
+                    const nx0 = n.startStep; const nx1 = n.startStep + n.lengthSteps
+                    const ny = n.pitch
+                    if (nx1 >= stepMin && nx0 <= stepMax && ny >= pitchMin && ny <= pitchMax) sel.add(n.id)
+                  }
+                  setSelectedIds(sel); setSelectedId(sel.size === 1 ? Array.from(sel)[0] : null)
+                }
+                window.addEventListener('mousemove', onMove, { passive:false }); window.addEventListener('mouseup', onUp)
+                return
+              }
+              // Plain left click: live preview + drag to position, commit on release
               e.preventDefault(); e.stopPropagation()
               const host = e.currentTarget.getBoundingClientRect()
-              const x = (e.clientX - host.left)
-              const y = e.clientY - host.top
-              marqueeRef.current = { active: true, x0: x, y0: y, x1: x, y1: y }
-              setMarqueeBox({ x, y, w: 0, h: 0 })
+              const startX = e.clientX - host.left
+              const startY = e.clientY - host.top
+              let step = Math.max(0, Math.floor(startX / (STEP_UNIT*zoomX)))
+              let row = Math.max(0, Math.min(PITCH_COUNT - 1, Math.floor(startY / (ROW_UNIT*zoomY))))
+              let pitch = PITCH_MAX - row
+              const patId = activePatternId
+              const ghostEl = document.createElement('div')
+              Object.assign(ghostEl.style, { position:'absolute', left: Math.round(step*STEP_UNIT*zoomX)+'px', top: Math.round(row*ROW_UNIT*zoomY)+'px', width: Math.max(1, Math.round(placeLenSteps*STEP_UNIT*zoomX))+'px', height:'14px', background:'rgba(125,211,252,0.35)', border:'1px solid rgba(186,230,253,0.6)', borderRadius:'3px', pointerEvents:'none', zIndex: 10 })
+              e.currentTarget.appendChild(ghostEl)
+              // start preview (oscillator or soundfont depending on synth)
+              if (!heldKeysRef.current.has('MOUSE_NOTE')) {
+                heldKeysRef.current.add('MOUSE_NOTE')
+                try {
+                  ensureAudio(); const ctx = audioCtxRef.current; const master = masterRef.current
+                  const v = Math.max(0.05, Math.min(1, instVel/10))
+                  if (isSfSynth(synth)) {
+                    const node = playSf(pitch, ctx.currentTime, 2.0, v, sfInstrFromSynthName(synth) || 'acoustic_grand_piano')
+                    heldOscsRef.current.set('MOUSE_NOTE', { sf: node })
+                  } else {
+                    const osc = ctx.createOscillator(); const g = ctx.createGain()
+                    osc.type = (synth||'Triangle').toLowerCase(); osc.frequency.setValueAtTime(440*Math.pow(2,(pitch-69)/12), ctx.currentTime)
+                    g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.linearRampToValueAtTime(v, ctx.currentTime + 0.005)
+                    osc.connect(g); g.connect(master); osc.start();
+                    heldOscsRef.current.set('MOUSE_NOTE', { osc, g })
+                  }
+                } catch {}
+              }
               const onMove = (ev) => {
                 const xm = ev.clientX - host.left
                 const ym = ev.clientY - host.top
-                marqueeRef.current.x1 = xm; marqueeRef.current.y1 = ym
-                const xMin = Math.min(marqueeRef.current.x0, xm)
-                const yMin = Math.min(marqueeRef.current.y0, ym)
-                const xMax = Math.max(marqueeRef.current.x0, xm)
-                const yMax = Math.max(marqueeRef.current.y0, ym)
-                setMarqueeBox({ x: xMin, y: yMin, w: xMax - xMin, h: yMax - yMin })
-              }
-              const onUp = () => {
-                window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp)
-                const box = marqueeRef.current; marqueeRef.current.active = false
-                setMarqueeBox(null); suppressClickRef.current = true
-                if (!song) return
-                const xMin = Math.min(box.x0, box.x1), xMax = Math.max(box.x0, box.x1)
-                const yMin = Math.min(box.y0, box.y1), yMax = Math.max(box.y0, box.y1)
-                const stepMin = Math.floor(xMin / (STEP_UNIT*zoomX))
-                const stepMax = Math.floor(xMax / (STEP_UNIT*zoomX))
-                const rowMin = Math.floor(yMin / (ROW_UNIT*zoomY))
-                const rowMax = Math.floor(yMax / (ROW_UNIT*zoomY))
-                const pitchMin = PITCH_MAX - rowMax
-                const pitchMax = PITCH_MAX - rowMin
-                const sel = new Set()
-                for (const n of (notesForEditor||[])) {
-                  const nx0 = n.startStep; const nx1 = n.startStep + n.lengthSteps
-                  const ny = n.pitch
-                  if (nx1 >= stepMin && nx0 <= stepMax && ny >= pitchMin && ny <= pitchMax) sel.add(n.id)
+                const stepNew = Math.max(0, Math.floor(xm / (STEP_UNIT*zoomX)))
+                const rowNew = Math.max(0, Math.min(PITCH_COUNT - 1, Math.floor(ym / (ROW_UNIT*zoomY))))
+                if (stepNew !== step) { step = stepNew; ghostEl.style.left = Math.round(step*STEP_UNIT*zoomX)+'px' }
+                if (rowNew !== row) {
+                  row = rowNew; pitch = PITCH_MAX - row; ghostEl.style.top = Math.round(row*ROW_UNIT*zoomY)+'px'
                 }
-                setSelectedIds(sel); setSelectedId(sel.size === 1 ? Array.from(sel)[0] : null)
+                // always retune preview to current pitch during drag (oscillator only)
+                try { const ctx = audioCtxRef.current; const o = heldOscsRef.current.get('MOUSE_NOTE'); if (o && o.osc) o.osc.frequency.setValueAtTime(440*Math.pow(2,(pitch-69)/12), ctx.currentTime) } catch {}
+                // for soundfont, re-trigger when pitch changes
+                try {
+                  const ctx = audioCtxRef.current; const o = heldOscsRef.current.get('MOUSE_NOTE')
+                  if (o && o.sf && typeof o.midi === 'number' && o.midi !== pitch) {
+                    stopSfNode(o.sf)
+                    const v2 = Math.max(0.05, Math.min(1, instVel/10))
+                    const instName = sfInstrFromSynthName(synth) || 'acoustic_grand_piano'
+                    const node2 = playSf(pitch, ctx?.currentTime || 0, 2.0, v2, instName)
+                    heldOscsRef.current.set('MOUSE_NOTE', { sf: node2, midi: pitch })
+                  } else if (o && o.sf && o.midi === undefined) {
+                    // initialize midi tracking if missing
+                    o.midi = pitch
+                    heldOscsRef.current.set('MOUSE_NOTE', o)
+                  }
+                } catch {}
               }
-              window.addEventListener('mousemove', onMove, { passive:false }); window.addEventListener('mouseup', onUp)
+              const onUp = (ev) => {
+                window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp)
+                try { ghostEl.remove() } catch {}
+                if (heldKeysRef.current.has('MOUSE_NOTE')) {
+                  heldKeysRef.current.delete('MOUSE_NOTE')
+                  try { const ctx = audioCtxRef.current; const o = heldOscsRef.current.get('MOUSE_NOTE'); if (o) { if (o.sf) { stopSfNode(o.sf) } else if (o.g && o.osc && ctx) { o.g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.05); o.osc.stop(ctx.currentTime + 0.08) } } heldOscsRef.current.delete('MOUSE_NOTE') } catch {}
+                }
+                suppressClickRef.current = true
+                const id = Date.now().toString(36)+Math.random().toString(36).slice(2)
+                const ops = [{ type:'note_add', id, pitch, startStep: step, lengthSteps: placeLenSteps, velocity: Math.max(0.05, Math.min(1, instVel/10)), synth, patternId: patId }]
+                try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops }) } catch {}
+              }
+              window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp)
             }}
             onClick={(e) => {
-              if (mode === 'arrangement') return
               if (suppressClickRef.current) { suppressClickRef.current = false; return }
               const host = e.currentTarget.getBoundingClientRect()
               const x = (e.clientX - host.left)
@@ -1168,10 +2206,57 @@ export default function Sequencer({ socket, onBack }) {
               const deltaSteps = snapStep(pxToStep((x - noteDragRef.current.startX) / zoomX))
               if (noteDragRef.current.mode === 'move') {
                 const base = noteDragRef.current
-                const y = e.clientY - rect.top
+                const y = e.clientY - rect2.top
                 const deltaRows = Math.round((y - base.startY) / (ROW_UNIT*zoomY))
                 const newGroupMin = clamp(base.groupMinStart + deltaSteps, 0, patternSteps - Math.max(1, base.groupMaxEnd - base.groupMinStart))
                 const appliedDelta = newGroupMin - base.groupMinStart
+                // Ensure drag preview exists (oscillator or soundfont)
+                if (!heldKeysRef.current.has('DRAG_NOTE')) {
+                  heldKeysRef.current.add('DRAG_NOTE')
+                  try {
+                    ensureAudio(); try { audioCtxRef.current?.resume?.() } catch {}
+                    const ctx = audioCtxRef.current; const master = masterRef.current
+                    if (ctx && master) {
+                      const primaryId = (base.groupIds && base.groupIds.length) ? base.groupIds[0] : base.id
+                      const origPitch = base.pitchById[primaryId]
+                      const primaryNote = (notesForEditor||[]).find(x => x.id === primaryId)
+                      const dragSynthName = (primaryNote && primaryNote.synth) ? primaryNote.synth : (synth||'Triangle')
+                      const startPitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, (origPitch||60)))
+                      const v = Math.max(0.05, Math.min(1, instVel/10))
+                      if (isSfSynth(dragSynthName)) {
+                        const node = playSf(startPitch, ctx.currentTime, 2.0, v, sfInstrFromSynthName(dragSynthName) || 'acoustic_grand_piano')
+                        heldOscsRef.current.set('DRAG_NOTE', { sf: node, midi: startPitch })
+                      } else {
+                        const osc = ctx.createOscillator(); const g = ctx.createGain()
+                        osc.type = String(dragSynthName||'Triangle').toLowerCase()
+                        osc.frequency.setValueAtTime(440*Math.pow(2,(startPitch-69)/12), ctx.currentTime)
+                        g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.linearRampToValueAtTime(v, ctx.currentTime + 0.005)
+                        osc.connect(g); g.connect(master); osc.start()
+                        heldOscsRef.current.set('DRAG_NOTE', { osc, g })
+                      }
+                    }
+                  } catch {}
+                }
+                // Retune drag preview
+                try { const ctx = audioCtxRef.current; const o = heldOscsRef.current.get('DRAG_NOTE'); if (o && ctx) {
+                  const primaryId = (base.groupIds && base.groupIds.length) ? base.groupIds[0] : base.id
+                  const origPitch = base.pitchById[primaryId]
+                  const newPitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, (origPitch||60) - deltaRows))
+                  // oscillator: live retune; soundfont: re-trigger if pitch changed
+                  if (o.osc) {
+                    const primaryNote = (notesForEditor||[]).find(x => x.id === primaryId)
+                    if (primaryNote && primaryNote.synth) { try { o.osc.type = String(primaryNote.synth).toLowerCase() } catch {} }
+                    o.osc.frequency.setValueAtTime(440*Math.pow(2,(newPitch-69)/12), ctx.currentTime)
+                  } else if (o.sf) {
+                    if (o.midi !== newPitch) {
+                      try { stopSfNode(o.sf) } catch {}
+                      const v = Math.max(0.05, Math.min(1, instVel/10))
+                      const instName = sfInstrFromSynthName((notesForEditor||[]).find(x=>x.id===primaryId)?.synth || synth) || 'acoustic_grand_piano'
+                      const node = playSf(newPitch, ctx.currentTime, 2.0, v, instName)
+                      heldOscsRef.current.set('DRAG_NOTE', { sf: node, midi: newPitch })
+                    }
+                  }
+                } } catch {}
                 setSong(prev => {
                   if (!prev) return prev
                   if (prev.patterns && prev.activePatternId) {
@@ -1238,7 +2323,14 @@ export default function Sequencer({ socket, onBack }) {
               }
               if (!noteDragRef.current.active) return
               const base = noteDragRef.current
+              // Prevent grid click from adding a new note after a drag
+              suppressClickRef.current = true
               noteDragRef.current.active = false
+              // stop drag preview
+              if (heldKeysRef.current.has('DRAG_NOTE')) {
+                heldKeysRef.current.delete('DRAG_NOTE')
+                try { const ctx = audioCtxRef.current; const o = heldOscsRef.current.get('DRAG_NOTE'); if (o) { if (o.sf) { stopSfNode(o.sf) } else if (o.g && o.osc && ctx) { o.g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.05); o.osc.stop(ctx.currentTime + 0.08) } } heldOscsRef.current.delete('DRAG_NOTE') } catch {}
+              }
               if (base.mode === 'move' && base.groupIds && base.groupIds.length > 0) {
                 const ops = []
                 for (const gid of base.groupIds) {
@@ -1262,6 +2354,34 @@ export default function Sequencer({ socket, onBack }) {
             <div ref={gridMarkerRef} data-marker="1" className="absolute top-0 h-full" style={{ transform: 'translateX(0px)', willChange: 'transform' }}>
               <div className="w-[1px] h-full bg-yellow-400/80" />
             </div>
+            {/* Compose caret and ghosts */}
+            {composeOn && (
+              <>
+                <div ref={composeCaretRef} className="absolute top-0 h-full" style={{ left: Math.round(composeStep*STEP_UNIT*zoomX)+'px' }}>
+                  <div className="w-[1px] h-full bg-sky-300/80" />
+                </div>
+                {/* Ghost notes for currently held keys */}
+                {Array.from(composeDownRef.current.entries()).filter(([k,v])=>k!=='Space').map(([k,v])=>{
+                  const spb = song.stepsPerBar
+                  const patSteps = Math.max(1, (activePattern?.bars||patternBars||4)*spb)
+                  const clip = (song.clips||[]).find(c=>c.id===composeClipId)
+                  if (!clip) return null
+                  const anchor = ((clip.startStep % patSteps)+patSteps)%patSteps
+                  const absStart = (v && Number.isFinite(v.startStepAbs)) ? v.startStepAbs : chordStartStepRef.current
+                  const localStart = ((absStart - anchor)+patSteps)%patSteps
+                  const now = performance.now()
+                  const msPerBeat = 60000/tempo; const msPerBar = msPerBeat*4; const msPerStep = msPerBar/spb
+                  const heldStepsFloat = Math.max(0, (now - (v?.tsMs||now))/msPerStep)
+                  const heldSteps = Math.max(1, Math.round(heldStepsFloat))
+                  const x = Math.round(localStart*STEP_UNIT*zoomX)
+                  const w = Math.max(1, Math.round(heldStepsFloat*STEP_UNIT*zoomX))
+                  const midi = wrapPitchToVisible(v?.midi||60)
+                  const row = (PITCH_MAX - midi)
+                  const y = Math.round(row*ROW_UNIT*zoomY)
+                  return <div ref={el => { if (el) composeGhostRefsRef.current[k] = el; else delete composeGhostRefsRef.current[k] }} key={'ghost_'+k} className="absolute rounded bg-sky-400/30 border border-sky-300/50 pointer-events-none" style={{ left:x, top:y, width:w, height:14 }} />
+                })}
+              </>
+            )}
             {/* Marquee box */}
             {marqueeBox && (
               <div className="absolute border border-yellow-400/60 bg-yellow-400/10 pointer-events-none" style={{ left: Math.min(marqueeBox.x, marqueeBox.x+marqueeBox.w), top: Math.min(marqueeBox.y, marqueeBox.y+marqueeBox.h), width: Math.abs(marqueeBox.w), height: Math.abs(marqueeBox.h) }} />
@@ -1328,7 +2448,7 @@ export default function Sequencer({ socket, onBack }) {
                   }}
                   className="absolute rounded-[3px] cursor-pointer group"
                   style={{ left:x, top:y, width:w, height:14,
-                           background: SYNTH_COLOR[(n && n.synth) ? n.synth : (typeof n.synth === 'string' ? n.synth : 'Triangle')] || SYNTH_COLOR.Triangle,
+                           background: (typeof n.synth === 'string' && n.synth.startsWith('SF:')) ? sfGradientFor(n.synth.slice(3)) : (SYNTH_COLOR[(n && n.synth) ? n.synth : (typeof n.synth === 'string' ? n.synth : 'Triangle')] || SYNTH_COLOR.Triangle),
                            boxShadow: (selected || (selectedIds && selectedIds.has(n.id))) ? 'inset 0 0 0 2px rgba(255,255,255,0.9)' : 'inset 0 0 0 1px rgba(0,0,0,0.25)'}}
                 >
                   {/* resize handle */}
@@ -1424,15 +2544,101 @@ export default function Sequencer({ socket, onBack }) {
               } finally { scrollSyncRef.current = false }
             }}>
               <div ref={arrRulerRef} className="relative select-none" style={{ height: `${RULER_H}px`, width: `${Math.round(arrSteps*stepWArr)}px`, backgroundImage: `repeating-linear-gradient(to right, rgba(255,255,255,0.12) 0, rgba(255,255,255,0.12) 1px, transparent 1px, transparent ${song.stepsPerBar*stepWArr}px), repeating-linear-gradient(to right, rgba(255,255,255,0.05) 0, rgba(255,255,255,0.05) 1px, transparent 1px, transparent ${stepWArr}px)`, backgroundPosition: '0.5px 0px, 0.5px 0px', backgroundRepeat: 'repeat' }}
-                   onMouseDown={(e)=>{
+                  onMouseDown={(e)=>{
+                    e.preventDefault(); e.stopPropagation()
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    const x = (e.clientX - rect.left)
+                    const sc = arrRulerScrollRef.current?.scrollLeft || 0
+                    const rawStepFloat = Math.max(0, Math.min(arrSteps-1, (sc + x) / stepWArr))
+                    const rawStep = Math.floor(rawStepFloat)
+                    const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
+                     if (e.altKey) {
+                       loopDragRef.current = { active: true, start: step }
+                       if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(step); setLocalLoopEndStep(step) }
+                       else {
+                         setLoopOn(true); setLoopStartStep(step); setLoopEndStep(step)
+                         try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: step, endStep: step }] }) } catch {}
+                       }
+                       return
+                     }
+                    // Click to set compose caret start (respect Space-anchored motion)
+                    const spaceHeld = !!composeDownRef.current.get('Space')
+                    if (spaceHeld) {
+                      chordStartStepRef.current = step
+                      chordStartTsRef.current = performance.now()
+                      composeLiveStepRef.current = step
+                    } else {
+                      setComposeStep(step)
+                      chordStartStepRef.current = step
+                      chordStartTsRef.current = 0
+                      composeLiveStepRef.current = step
+                    }
+                    setComposeGhostTick(t=>t+1)
+                  // Also move yellow caret (transport position) locally
+                  const barsLoc = step / song.stepsPerBar
+                  setBaseBar(barsLoc)
+                  setBaseTsMs(Date.now())
+                  schedRef.current.nextStep = Math.floor(barsLoc * song.stepsPerBar)
+                   }}
+                   onMouseMove={(e)=>{
                      const rect = e.currentTarget.getBoundingClientRect()
                      const x = (e.clientX - rect.left)
                      const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor(x / (stepWArr))))
                      const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
-                     const bars = step / song.stepsPerBar
-                     setBaseBar(bars); setBaseTsMs(Date.now()); schedRef.current.nextStep = Math.floor(bars*song.stepsPerBar)
+                     if (loopDragRef.current.active || e.altKey) {
+                       const a = Math.min(loopDragRef.current.start || step, step)
+                       const b = Math.max(loopDragRef.current.start || step, step)
+                       if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(a); setLocalLoopEndStep(b) }
+                       else {
+                         setLoopOn(true); setLoopStartStep(a); setLoopEndStep(b)
+                         try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: a, endStep: b }] }) } catch {}
+                       }
+                     }
+                   }}
+                  onMouseUp={(e)=>{
+                   const rect = e.currentTarget.getBoundingClientRect()
+                   const x = (e.clientX - rect.left)
+                   const sc = arrRulerScrollRef.current?.scrollLeft || 0
+                   const rawStep = Math.max(0, Math.min(arrSteps-1, Math.round((sc + x) / (stepWArr))))
+                   const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
+                    if (loopDragRef.current.active) {
+                       const a = Math.min(loopDragRef.current.start, step)
+                       const b = Math.max(loopDragRef.current.start, step)
+                       if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(a); setLocalLoopEndStep(b) }
+                       else {
+                         setLoopOn(true); setLoopStartStep(a); setLoopEndStep(b)
+                         try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: a, endStep: b }] }) } catch {}
+                       }
+                       loopDragRef.current.active = false
+                       return
+                    }
+                    // If not looping, set compose caret here as well (more reliable than mousedown alone)
+                    if (!e.altKey) {
+                      const spaceHeld = !!composeDownRef.current.get('Space')
+                      if (spaceHeld) {
+                        chordStartStepRef.current = step
+                        chordStartTsRef.current = performance.now()
+                        composeLiveStepRef.current = step
+                      } else {
+                        setComposeStep(step)
+                        chordStartStepRef.current = step
+                        chordStartTsRef.current = 0
+                        composeLiveStepRef.current = step
+                      }
+                      // reset preview tracker to avoid stale step gaps
+                      caretStepFloatPrevRef.current = NaN
+                      setComposeGhostTick(t=>t+1)
+                      // And ensure yellow caret reflects the clicked position
+                      const barsLoc2 = step / song.stepsPerBar
+                      setBaseBar(barsLoc2)
+                      setBaseTsMs(Date.now())
+                      schedRef.current.nextStep = Math.floor(barsLoc2 * song.stepsPerBar)
+                    }
                    }}
               >
+                {(independentPattern ? localLoopOn : loopOn) && ((independentPattern ? localLoopEndStep : loopEndStep) > (independentPattern ? localLoopStartStep : loopStartStep)) && (
+                  <div className="absolute top-0 h-full pointer-events-none" style={{ left: Math.round((independentPattern ? localLoopStartStep : loopStartStep)*stepWArr)+'px', width: Math.max(1, Math.round(((independentPattern ? localLoopEndStep : loopEndStep)-(independentPattern ? localLoopStartStep : loopStartStep))*stepWArr))+'px', background: 'rgba(34,197,94,0.18)', outline: '1px solid rgba(34,197,94,0.7)', zIndex: 5 }} />
+                )}
                 <div ref={arrRulerMarkerRef} className="absolute top-0 h-full" style={{ transform: 'translateX(0px)', willChange: 'transform', opacity: 0 }}>
                   <div className="w-[1px] h-full bg-yellow-400" />
                 </div>
@@ -1464,16 +2670,75 @@ export default function Sequencer({ socket, onBack }) {
                 // derive track and relative y inside that track band
                 const yAbs = Math.max(0, Math.min(rect.height - 1, e.clientY - rect.top))
                 const track = Math.max(0, Math.min(ARR_TRACKS - 1, Math.floor(yAbs / ARR_TRACK_H)))
+                lastArrTrackRef.current = track
                 const ty = (yAbs - track * ARR_TRACK_H) / ARR_TRACK_H
                 if (sx>=0 && sx<=1 && sy>=0 && sy<=1) emitCursor({ sect: 'arr_grid', sx, sy, track, ty }, true)
               }}
               onMouseDown={(e)=>{
                 if (mode !== 'arrangement') return
+                if (e.button !== 0) return
                 const host = (arrGridRef.current ? arrGridRef.current.getBoundingClientRect() : e.currentTarget.firstChild.getBoundingClientRect())
                 const trackIdx = Math.max(0, Math.min(ARR_TRACKS-1, Math.floor((e.clientY - host.top) / ARR_TRACK_H)))
                 const x = (e.clientX - host.left)
-                const rawStep = Math.max(0, Math.min(arrSteps-1, Math.floor(x / (stepWArr))))
+                const rawStep = Math.max(0, Math.min(arrSteps-1, Math.round(x / (stepWArr))))
                 const step = Math.max(0, Math.min(arrSteps-1, snapStepArr(rawStep)))
+                // Update compose caret and clip targeting when clicking grid
+                if (composeOn) {
+                  const clipsAtStep = (song?.clips||[]).filter(c => step>=c.startStep && step < (c.startStep+c.lengthSteps))
+                  let target = clipsAtStep.find(c => c.track === trackIdx) || clipsAtStep[0] || null
+                  if (target) {
+                    setComposeClipId(target.id)
+                  }
+                  const spaceHeld = !!composeDownRef.current.get('Space')
+                  if (spaceHeld) {
+                    chordStartStepRef.current = step
+                    chordStartTsRef.current = performance.now()
+                    composeLiveStepRef.current = step
+                  } else {
+                    setComposeStep(step)
+                    chordStartStepRef.current = step
+                    chordStartTsRef.current = 0
+                    composeLiveStepRef.current = step
+                  }
+                  caretStepFloatPrevRef.current = NaN
+                  setComposeGhostTick(t=>t+1)
+                }
+                // ALT: start loop drag directly on the track lane; also capture track for pattern-from-loop
+                if (e.altKey) {
+                  loopTrackRef.current = trackIdx
+                  if (loopMakeOn) setLoopMakeTrack(trackIdx)
+                  loopDragRef.current = { active: true, start: step }
+                  if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(step); setLocalLoopEndStep(step) }
+                  else { setLoopOn(true); setLoopStartStep(step); setLoopEndStep(step); try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: step, endStep: step }] }) } catch {} }
+                  const onMove = (ev) => {
+                    const xm = Math.max(0, Math.min(arrSteps-1, Math.floor((ev.clientX - host.left) / stepWArr)))
+                    const st = Math.max(0, Math.min(arrSteps-1, snapStepArr(xm)))
+                    // track under mouse as you drag
+                    const yAbsM = Math.max(0, Math.min(host.height - 1, ev.clientY - host.top))
+                    const trM = Math.max(0, Math.min(ARR_TRACKS - 1, Math.floor(yAbsM / ARR_TRACK_H)))
+                    loopTrackRef.current = trM
+                    if (loopMakeOn) setLoopMakeTrack(trM)
+                    const a = Math.min(loopDragRef.current.start || st, st)
+                    const b = Math.max(loopDragRef.current.start || st, st)
+                    if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(a); setLocalLoopEndStep(b) }
+                    else { setLoopOn(true); setLoopStartStep(a); setLoopEndStep(b); try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: a, endStep: b }] }) } catch {} }
+                  }
+                  const onUp = (ev) => {
+                    window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp)
+                    const xm = Math.max(0, Math.min(arrSteps-1, Math.floor((ev.clientX - host.left) / stepWArr)))
+                    const stp = Math.max(0, Math.min(arrSteps-1, snapStepArr(xm)))
+                    const a = Math.min(loopDragRef.current.start, stp)
+                    const b = Math.max(loopDragRef.current.start, stp)
+                    if (independentPattern) { setLocalLoopOn(true); setLocalLoopStartStep(a); setLocalLoopEndStep(b) }
+                    else { setLoopOn(true); setLoopStartStep(a); setLoopEndStep(b); try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [{ type: 'set_loop', on: true, startStep: a, endStep: b }] }) } catch {} }
+                    // finalize chosen track for P preview if active
+                    if (loopMakeOn && Number.isFinite(loopTrackRef.current)) setLoopMakeTrack(Math.max(0, Math.min(ARR_TRACKS-1, Number(loopTrackRef.current))))
+                    loopDragRef.current.active = false
+                  }
+                  window.addEventListener('mousemove', onMove)
+                  window.addEventListener('mouseup', onUp)
+                  return
+                }
                 // section-aware cursor for arrangement grid with track-local y
                 const sx = (e.clientX - host.left) / Math.max(1, host.width)
                 const sy = (e.clientY - host.top) / Math.max(1, host.height)
@@ -1523,6 +2788,9 @@ export default function Sequencer({ socket, onBack }) {
               }}
             >
             <div ref={arrGridRef} className="relative" style={{ width: `${Math.round(arrSteps*stepWArr)}px`, height: `${ARR_TRACKS*ARR_TRACK_H}px` }}>
+                {(independentPattern ? localLoopOn : loopOn) && ((independentPattern ? localLoopEndStep : loopEndStep) > (independentPattern ? localLoopStartStep : loopStartStep)) && (
+                  <div className="absolute top-0 h-full pointer-events-none" style={{ left: Math.round((independentPattern ? localLoopStartStep : loopStartStep)*stepWArr)+'px', width: Math.max(1, Math.round(((independentPattern ? localLoopEndStep : loopEndStep)-(independentPattern ? localLoopStartStep : loopStartStep))*stepWArr))+'px', background: 'rgba(34,197,94,0.10)', outline: '1px solid rgba(34,197,94,0.5)', zIndex: 3 }} />
+                )}
                 {/* grid */}
                 <div className="absolute inset-0"
                   style={{
@@ -1531,6 +2799,19 @@ export default function Sequencer({ socket, onBack }) {
                                       repeating-linear-gradient(to bottom, rgba(255,255,255,0.05) 0, rgba(255,255,255,0.05) 1px, transparent 1px, transparent ${ARR_TRACK_H}px)`,
                     backgroundPosition: '0.5px 0.5px, 0.5px 0.5px, 0.5px 0.5px'
                   }} />
+                {/* pattern-from-loop preview overlay on chosen track */}
+                {loopMakeOn && effLoopOn && (effLoopEnd > effLoopStart) && (
+                  (() => {
+                    const left = Math.round(effLoopStart * stepWArr)
+                    const width = Math.max(1, Math.round((effLoopEnd - effLoopStart) * stepWArr))
+                    const top = loopMakeTrack * ARR_TRACK_H
+                    const bad = (song.clips||[]).some(c => c.track===loopMakeTrack && !(effLoopEnd <= c.startStep || effLoopStart >= (c.startStep + c.lengthSteps)))
+                    return (
+                      <div className={bad?"absolute rounded border border-red-400/80 bg-red-500/20 pointer-events-none":"absolute rounded border border-blue-300/80 bg-blue-400/20 pointer-events-none"}
+                           style={{ left:left+'px', top: top+'px', width: width+'px', height: (ARR_TRACK_H-2)+'px', zIndex: 6 }} />
+                    )
+                  })()
+                )}
                 {/* Ghost clip */}
                 {ghost.on && (
                   <div className={ghost.bad ? "absolute rounded border border-red-400/70 bg-red-500/20 pointer-events-none" : "absolute rounded border border-blue-300/70 bg-blue-400/20 pointer-events-none"}
@@ -1549,34 +2830,154 @@ export default function Sequencer({ socket, onBack }) {
                   const key = pat ? `${pat.id}@${stepWArr.toFixed(4)}` : ''
                   const bg = key ? (patternPreviewRef.current.get(key) || '') : ''
                   return (
-                    <div key={c.id} className="absolute rounded bg-blue-500/60 border border-blue-300/50"
-                      style={{ left:x, top:y+4, width:w, height:ARR_TRACK_H-8, backgroundImage: bg?`url(${bg})`:'none', backgroundSize: `${pat?Math.round((pat.bars*song.stepsPerBar)*stepWArr):Math.round(patternSteps*stepWArr)}px ${ARR_TRACK_H-8}px`, backgroundRepeat:'repeat-x', backgroundPosition: `0px 0px` }}
+                    <div key={c.id} className="absolute rounded border"
+                      style={{ left:x, top:y+4, width:w, height:ARR_TRACK_H-8, backgroundImage: bg?`url(${bg})`:'none', backgroundSize: `${pat?Math.round((pat.bars*song.stepsPerBar)*stepWArr):Math.round(patternSteps*stepWArr)}px ${ARR_TRACK_H-8}px`, backgroundRepeat:'repeat-x', backgroundPosition: `0px 0px`,
+                               backgroundColor: selectedClipIds.has(c.id) ? 'rgba(59,130,246,0.75)' : 'rgba(59,130,246,0.6)', borderColor: selectedClipIds.has(c.id) ? 'rgba(147,197,253,0.9)' : 'rgba(147,197,253,0.5)' }}
                       data-prev={previewVersion}
                       onMouseDown={(e) => {
                         if (e.button !== 0) return
                         e.preventDefault(); e.stopPropagation()
+                        // selection handling (Ctrl to multi-select, otherwise single)
+                        setSelectedClipIds(prev => {
+                          const next = new Set(prev)
+                          if (e.ctrlKey || e.metaKey) { if (next.has(c.id)) next.delete(c.id); else next.add(c.id) }
+                          else { next.clear(); next.add(c.id) }
+                          return next
+                        })
+                        // Auto-select this clip's pattern if linking is enabled
+                        if (linkClipToPattern && c.patternId && c.patternId !== activePatternId) {
+                          if (independentPattern) { setLocalPatternId(c.patternId) }
+                          else { try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'pattern_select', id: c.patternId }] }) } catch {} }
+                        }
+                        // If compose is ON, switch compose target to this clip for note placement
+                        if (composeOn) {
+                          setComposeClipId(c.id)
+                          // Re-anchor compose to this clip's start if Space is held
+                          if (composeDownRef.current.get('Space')) {
+                            chordStartStepRef.current = c.startStep
+                            chordStartTsRef.current = performance.now()
+                          }
+                          setComposeGhostTick(t=>t+1)
+                        }
                         const host = e.currentTarget.parentElement.getBoundingClientRect()
                         const startX = e.clientX - host.left
+                        const startY = e.clientY - host.top
                         const startStep = c.startStep
                         const startLen = c.lengthSteps
-                        const isResize = (startX - x) > (w - 10)
+                        const startTrack = c.track
+                        const distLeft = Math.max(0, startX - x)
+                        const distRight = Math.max(0, (x + w) - startX)
+                        const edgeThreshold = Math.min(10, Math.floor(w / 3))
+                        let isResizeLeft = distLeft <= edgeThreshold
+                        let isResizeRight = !isResizeLeft && (distRight <= edgeThreshold)
+                        const isResize = isResizeLeft || isResizeRight
+                        const initialSelection = (e.ctrlKey || e.metaKey) ? new Set(selectedClipIds).add(c.id) : (selectedClipIds.size ? new Set(selectedClipIds) : new Set([c.id]))
+                        const items = (song?.clips||[]).filter(q => initialSelection.has(q.id))
+                        const baseById = new Map(items.map(item => [item.id, { startStep: item.startStep, track: item.track, lengthSteps: item.lengthSteps }]))
                         const onMove = (ev) => {
                           const xm = ev.clientX - host.left
-                          const delta = snapStep(pxToStep((xm - startX) / zoomX))
-                          if (isResize) {
-                            const newLen = clamp(startLen + delta, 1, arrSteps - startStep)
-                            setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).map(q => q.id===c.id?{...q, lengthSteps:newLen}:q) } : prev)
+                          const ym = ev.clientY - host.top
+                          const deltaSteps = snapStepArr(Math.floor((xm - startX) / stepWArr))
+                          const deltaTracksRaw = Math.round((ym - startY) / ARR_TRACK_H)
+                          const deltaTracks = ev.shiftKey ? 0 : deltaTracksRaw
+                          if (isResize && items.length === 1) {
+                            setSong(prev => {
+                              if (!prev) return prev
+                              const others = (prev.clips||[]).filter(q => q.track === startTrack && q.id !== c.id)
+                              if (isResizeRight) {
+                                // cap to next clip start on same track
+                                let maxLen = arrSteps - startStep
+                                for (const o of others) {
+                                  const oStart = o.startStep
+                                  if (oStart > startStep) maxLen = Math.min(maxLen, oStart - startStep)
+                                }
+                                const newLen = clamp(startLen + deltaSteps, 1, Math.max(1, maxLen))
+                                return { ...prev, clips: (prev.clips||[]).map(q => q.id===c.id?{...q, lengthSteps:newLen}:q) }
+                              } else {
+                                // left edge: move start earlier/later and adjust length opposite
+                                // find previous clip end to avoid overlap
+                                let minStart = 0
+                                for (const o of others) {
+                                  const oEnd = o.startStep + o.lengthSteps
+                                  if (oEnd <= startStep) minStart = Math.max(minStart, oEnd)
+                                }
+                                let candidateStart = clamp(startStep + deltaSteps, minStart, startStep + startLen - 1)
+                                // keep within grid bounds
+                                candidateStart = clamp(candidateStart, 0, Math.max(0, startStep + startLen - 1))
+                                const newLen = clamp(startLen + (startStep - candidateStart), 1, startLen + (startStep - minStart))
+                                const newStart = clamp(candidateStart, minStart, startStep + startLen - 1)
+                                return { ...prev, clips: (prev.clips||[]).map(q => q.id===c.id?{...q, startStep:newStart, lengthSteps:newLen}:q) }
+                              }
+                            })
                           } else {
-                            const newStart = clamp(startStep + delta, 0, arrSteps - startLen)
-                            setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).map(q => q.id===c.id?{...q, startStep:newStart}:q) } : prev)
+                            setSong(prev => {
+                              if (!prev) return prev
+                              const nonSelected = (prev.clips||[]).filter(z => !initialSelection.has(z.id))
+                              function overlapsAny(track, start, len, selfId) {
+                                const end = start + len
+                                for (const z of nonSelected) {
+                                  if (z.track !== track) continue
+                                  const ze = z.startStep + z.lengthSteps
+                                  if (start < ze && end > z.startStep) return true
+                                }
+                                return false
+                              }
+                              return { ...prev, clips: (prev.clips||[]).map(q => {
+                                if (!initialSelection.has(q.id)) return q
+                                const base = baseById.get(q.id) || { startStep: q.startStep, track: q.track }
+                                let nextStart = clamp(base.startStep + deltaSteps, 0, arrSteps - q.lengthSteps)
+                                let nextTrack = clamp(base.track + deltaTracks, 0, ARR_TRACKS - 1)
+                                if (overlapsAny(nextTrack, nextStart, q.lengthSteps, q.id)) {
+                                  nextStart = base.startStep
+                                  nextTrack = base.track
+                                }
+                                return { ...q, startStep: nextStart, track: nextTrack }
+                              }) }
+                            })
                           }
                         }
                         const onUp = (ev) => {
                           window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp)
-                          const cur = (song?.clips||[]).find(q => q.id === c.id)
-                          if (!cur) return
-                          const op = isResize ? { type:'clip_update', id:c.id, lengthSteps: cur.lengthSteps } : { type:'clip_update', id:c.id, startStep: cur.startStep }
-                          try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops: [op] }) } catch {}
+                          const current = (songRef.current?.clips||[]).filter(q => initialSelection.has(q.id))
+                          const ops = []
+                          for (const it of current) {
+                            const base = baseById.get(it.id)
+                            if (!base) continue
+                            if (isResize && items.length === 1) {
+                              if (isResizeRight) {
+                                if (it.lengthSteps !== base.lengthSteps) ops.push({ type:'clip_update', id: it.id, lengthSteps: it.lengthSteps })
+                              } else if (isResizeLeft) {
+                                if (it.startStep !== base.startStep || it.lengthSteps !== base.lengthSteps) ops.push({ type:'clip_update', id: it.id, startStep: it.startStep, lengthSteps: it.lengthSteps })
+                              }
+                            } else {
+                              if (it.startStep !== base.startStep) ops.push({ type:'clip_update', id: it.id, startStep: it.startStep })
+                              if (it.track !== base.track) ops.push({ type:'clip_update', id: it.id, track: it.track })
+                            }
+                          }
+                          if (ops.length) {
+                            // Record pending updates so echoes don't revert local state
+                            const ts = Date.now()
+                            for (const o of ops) {
+                              const prev = pendingClipUpdatesRef.current.get(o.id) || {}
+                              const rec = { ...prev, ts }
+                              if (o.startStep !== undefined) rec.startStep = o.startStep
+                              if (o.track !== undefined) rec.track = o.track
+                              if (o.lengthSteps !== undefined) rec.lengthSteps = o.lengthSteps
+                              pendingClipUpdatesRef.current.set(o.id, rec)
+                            }
+                            try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops }) } catch {}
+                            // also optimistically apply to local state immediately to avoid flicker
+                            setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).map(q => {
+                              const upd = ops.find(o => o.id === q.id)
+                              if (!upd) return q
+                              return {
+                                ...q,
+                                startStep: (upd.startStep !== undefined ? upd.startStep : q.startStep),
+                                track: (upd.track !== undefined ? upd.track : q.track),
+                                lengthSteps: (upd.lengthSteps !== undefined ? upd.lengthSteps : q.lengthSteps)
+                              }
+                            }) } : prev)
+                          }
                         }
                         window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp)
                       }}
@@ -1667,6 +3068,29 @@ export default function Sequencer({ socket, onBack }) {
           {Object.entries(remoteTyping).map(([id, r]) => {
             if (!r || !r.text) return null
             const col = colorForKey(id)
+            const cur = remoteCursors[id]
+            if (cur && typeof cur.sect === 'string' && isFinite(cur.sx) && isFinite(cur.sy)) {
+              let target = null
+              if (cur.sect === 'pattern_grid') target = gridRef.current
+              else if (cur.sect === 'arr_grid') target = arrGridRef.current
+              if (target) {
+                const rect = target.getBoundingClientRect()
+                const x = rect.left + cur.sx * rect.width
+                let y
+                if (cur.sect === 'arr_grid' && typeof cur.track === 'number' && isFinite(cur.track) && typeof cur.ty === 'number' && isFinite(cur.ty)) {
+                  const t = Math.max(0, Math.min(ARR_TRACKS - 1, Math.round(cur.track)))
+                  y = rect.top + (t * ARR_TRACK_H) + cur.ty * ARR_TRACK_H
+                } else {
+                  y = rect.top + cur.sy * rect.height
+                }
+                return (
+                  <div key={`rt_${id}`} className="absolute select-none" style={{ left: `${x}px`, top: `${y}px`, transform: 'translate(8px, -50%)' }}>
+                    <span className="font-medium" style={{ color: col, textShadow: '0 0 6px rgba(0,0,0,0.65)' }}>{r.text}</span>
+                  </div>
+                )
+              }
+            }
+            // Fallback to page-normalized position from typing event
             const rr = rootRef.current ? rootRef.current.getBoundingClientRect() : null
             if (!rr) return null
             const x = rr.left + (r.nx||0)*rr.width

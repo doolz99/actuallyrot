@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3001;
 
 const app = express();
 app.use(cors({ origin: '*'}));
+app.use(express.json({ limit: '10mb' }));
 // Timesync endpoint for NTP-like client clock sync
 app.use('/timesync', timesyncServer.requestHandler);
 
@@ -34,34 +35,49 @@ const pairs = new Map();
 const tvUsers = new Set();
 // Users currently on Sequencer page: Set of socketIds
 const seqUsers = new Set();
+// Global active song id shared by everyone on the sequencer page
+let activeSongId = 'default'
 // ---- Collaborative Sequencer: in-memory songs ----
 // song = { id, tempo, bars, stepsPerBar, lanes, grid, notes, playing, baseBar, baseTsMs, rev }
 const songs = new Map();
 function ensureSong(songId = 'default') {
   if (!songs.has(songId)) {
-    const bars = 4;
-    const stepsPerBar = 16;
-    const lanes = ['KICK', 'SNARE', 'HAT', 'CLAP'];
-    const total = bars * stepsPerBar;
-    const grid = Array.from({ length: lanes.length }, () => Array.from({ length: total }, () => false));
-    const notes = []; // piano roll notes: { id, startStep, lengthSteps, pitch, velocity }
-    songs.set(songId, {
-      id: songId,
-      tempo: 120,
-      bars,
-      stepsPerBar,
-      lanes,
-      grid,
-      notes,
-      patterns: [{ id: 'p1', name: 'Pattern 1', bars: 4, notes: [] }],
-      activePatternId: 'p1',
-      clips: [], // arrangement clips: { id, track, startStep, lengthSteps }
-      sfx: [],   // sfx events: { id, track, startStep, lengthSteps, url, gain, pan, offsetMs }
-      playing: false,
-      baseBar: 0,
-      baseTsMs: Date.now(),
-      rev: 1,
-    });
+    // Prefer persisted version if it exists
+    const persisted = (songsStore && typeof songsStore === 'object') ? songsStore[songId] : null;
+    if (persisted && typeof persisted === 'object') {
+      const clone = JSON.parse(JSON.stringify(persisted));
+      if (!clone.id) clone.id = songId;
+      if (typeof clone.rev !== 'number') clone.rev = 1;
+      songs.set(songId, clone);
+    } else {
+      const bars = 4;
+      const stepsPerBar = 16;
+      const lanes = ['KICK', 'SNARE', 'HAT', 'CLAP'];
+      const total = bars * stepsPerBar;
+      const grid = Array.from({ length: lanes.length }, () => Array.from({ length: total }, () => false));
+      const notes = []; // piano roll notes: { id, startStep, lengthSteps, pitch, velocity }
+      songs.set(songId, {
+        id: songId,
+        tempo: 120,
+        bars,
+        stepsPerBar,
+        lanes,
+        grid,
+        notes,
+        patterns: [{ id: 'p1', name: 'Pattern 1', bars: 4, notes: [] }],
+        activePatternId: 'p1',
+        clips: [], // arrangement clips: { id, track, startStep, lengthSteps }
+        sfx: [],   // sfx events: { id, track, startStep, lengthSteps, url, gain, pan, offsetMs }
+        playing: false,
+        baseBar: 0,
+        baseTsMs: Date.now(),
+        // Shared loop state
+        loopOn: false,
+        loopStartStep: 0,
+        loopEndStep: 0,
+        rev: 1,
+      });
+    }
   }
   return songs.get(songId);
 }
@@ -158,6 +174,51 @@ function ensureDevice(deviceId) {
 }
 
 loadTimesFromDisk();
+
+// ---- Songs persistence (simple JSON store) ----
+const SONGS_PATH = path.join(__dirname, 'songs.json');
+let songsStore = {};
+try {
+  if (fs.existsSync(SONGS_PATH)) {
+    const raw = JSON.parse(fs.readFileSync(SONGS_PATH, 'utf8'))
+    if (raw && typeof raw === 'object') songsStore = raw
+  }
+} catch {}
+function saveSongsToDisk() {
+  try { fs.writeFileSync(SONGS_PATH, JSON.stringify(songsStore, null, 2), 'utf8') } catch {}
+}
+
+// REST endpoints to save/load songs
+app.get('/songs', (_req, res) => {
+  try {
+    const memIds = Array.from(songs.keys ? songs.keys() : [])
+    const fileIds = Object.keys(songsStore)
+    const ids = Array.from(new Set([...(memIds||[]), ...(fileIds||[])]))
+    res.json({ ids })
+  } catch { res.status(500).json({ error: 'failed' }) }
+});
+app.get('/songs/:id', (req, res) => {
+  try {
+    const id = String(req.params.id||'').trim();
+    if (!id) return res.status(400).json({ error: 'missing id' })
+    const s = songsStore[id] || null
+    if (!s) return res.status(404).json({ error: 'not_found' })
+    return res.json({ song: s })
+  } catch { return res.status(500).json({ error: 'failed' }) }
+});
+app.put('/songs/:id', (req, res) => {
+  try {
+    const id = String(req.params.id||'').trim();
+    const body = req.body||{}
+    const song = body.song
+    if (!id || !song || typeof song !== 'object') return res.status(400).json({ error: 'bad_request' })
+    songsStore[id] = song
+    saveSongsToDisk()
+    // Update in-memory active snapshot for that id
+    songs.set(id, song)
+    return res.json({ ok: true })
+  } catch { return res.status(500).json({ error: 'failed' }) }
+});
 
 app.get('/', (_req, res) => {
   res.send('Chat backend is running');
@@ -325,13 +386,66 @@ io.on('connection', (socket) => {
   // Sequencer: join a song room and receive snapshot
   socket.on('seq_join', ({ songId }) => {
     try {
-      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : (activeSongId || 'default');
       const song = ensureSong(id);
       socket.join(`seq:${id}`);
       io.to(socket.id).emit('seq_song', { song, rev: song.rev });
       io.to(socket.id).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo });
     } catch {}
   });
+
+  // Sequencer: switch active song globally for all clients
+  socket.on('seq_switch_song', ({ id }) => {
+    try {
+      const nextId = (typeof id === 'string' && id.trim()) ? id.trim() : 'default'
+      activeSongId = nextId
+      const song = ensureSong(nextId)
+      // Move everyone to the new room and send snapshot
+      for (const [sid, sock] of io.sockets.sockets) {
+        try {
+          const rooms = Array.from(sock.rooms || [])
+          for (const r of rooms) { if (r.startsWith('seq:')) sock.leave(r) }
+          sock.join(`seq:${nextId}`)
+          io.to(sid).emit('seq_song', { song, rev: song.rev })
+          io.to(sid).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo })
+        } catch {}
+      }
+      // Announce selection change so UIs update their displayed song id if needed
+      io.emit('seq_active_song', { id: nextId })
+    } catch {}
+  })
+
+  // Sequencer: admin delete a song by id
+  socket.on('seq_delete_song', ({ id }) => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      const delId = (typeof id === 'string' && id.trim()) ? id.trim() : '';
+      if (!delId || delId === 'default') return;
+      // Remove from persisted store and memory
+      if (songsStore && Object.prototype.hasOwnProperty.call(songsStore, delId)) {
+        delete songsStore[delId];
+        saveSongsToDisk();
+      }
+      if (songs.has(delId)) songs.delete(delId);
+      // If deleting the active song, switch everyone back to default
+      if (activeSongId === delId) {
+        activeSongId = 'default';
+        const song = ensureSong(activeSongId);
+        for (const [sid, sock] of io.sockets.sockets) {
+          try {
+            const rooms = Array.from(sock.rooms || [])
+            for (const r of rooms) { if (r.startsWith('seq:')) sock.leave(r) }
+            sock.join(`seq:${activeSongId}`)
+            io.to(sid).emit('seq_song', { song, rev: song.rev })
+            io.to(sid).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo })
+          } catch {}
+        }
+        io.emit('seq_active_song', { id: activeSongId })
+      }
+      // Optionally notify clients so they can refresh lists
+      io.emit('songs_changed', { at: Date.now() })
+    } catch {}
+  })
 
   // Sequencer: apply ops
   socket.on('seq_ops', ({ songId, parentRev, ops }) => {
@@ -478,6 +592,17 @@ io.on('connection', (socket) => {
           const before = song.sfx.length;
           song.sfx = song.sfx.filter(c => c.id !== idstr);
           if (song.sfx.length !== before) { changed = true; structural = true; }
+        } else if (op.type === 'set_loop') {
+          const total = song.bars * song.stepsPerBar;
+          const on = !!op.on;
+          let a = Math.max(0, Math.min(total, Number(op.startStep) || 0));
+          let b = Math.max(0, Math.min(total, Number(op.endStep) || 0));
+          if (b < a) { const t = a; a = b; b = t; }
+          // Allow zero-length interim while dragging; UI should clamp to >=1 when finalizing
+          song.loopOn = on;
+          song.loopStartStep = a;
+          song.loopEndStep = b;
+          changed = true; structural = true;
         } else if (op.type === 'set_bars') {
           const nb = Math.max(1, Math.min(1000, Number(op.bars) || song.bars));
           if (nb !== song.bars) {
@@ -569,16 +694,28 @@ io.on('connection', (socket) => {
   });
 
   // Sequencer: transport control
-  socket.on('seq_transport', ({ songId, playing, positionBars, tempo }) => {
+  socket.on('seq_transport', ({ songId, playing, positionBars, tempo, shared }) => {
     try {
       const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
       const song = ensureSong(id);
       const now = Date.now();
+      // Keep tempo shared, but keep play/pause and position per-user
       if (typeof tempo === 'number' && tempo >= 40 && tempo <= 240) song.tempo = Math.round(tempo);
-      if (typeof playing === 'boolean') song.playing = playing;
-      if (typeof positionBars === 'number' && isFinite(positionBars)) song.baseBar = Math.max(0, positionBars);
-      song.baseTsMs = now;
-      io.to(`seq:${id}`).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo });
+      const payload = {
+        songId: song.id,
+        playing: !!playing,
+        baseBar: (typeof positionBars === 'number' && isFinite(positionBars)) ? Math.max(0, positionBars) : song.baseBar,
+        baseTsMs: now,
+        tempo: song.tempo,
+        from: socket.id,
+      };
+      if (shared) {
+        // Broadcast to all in the song room (including sender)
+        io.to(`seq:${id}`).emit('seq_transport', payload);
+      } else {
+        // Echo ONLY to the requesting socket so transport is independent per user
+        io.to(socket.id).emit('seq_transport', payload);
+      }
     } catch {}
   });
 

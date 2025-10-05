@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import panzoom from 'panzoom'
 import StaticBackground from './StaticBackground.jsx'
 
-export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, tvIds = [], adminIds = [], pinups = [], onRequestChat, onOpenTV }) {
+export default function Circles({ selfId, users, pairs, timesBySocket = {}, pairRot = {}, tvIds = [], adminIds = [], pinups = [], seqIds = [], onRequestChat, onOpenTV, onOpenSequencer }) {
   const viewportRef = useRef(null)
   const worldRef = useRef(null)
   const panzoomRef = useRef(null)
@@ -26,6 +26,8 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     return () => cancelAnimationFrame(raf)
   }, [])
 
+  
+
   // sizing helpers
   const TV_DIAMETER = 400
   const MAX_DIAMETER = Math.round((2/3) * TV_DIAMETER) // ~267
@@ -43,6 +45,100 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
   const tvTimerRef = useRef(null)
   const tvAudioRef = useRef(null)
   const tvHoverCountRef = useRef(0)
+  // Sequencer hover animation state
+  const [seqHover, setSeqHover] = useState(false)
+  const [seqStep, setSeqStep] = useState(0)
+  const seqHoverCountRef = useRef(0)
+  // Simple hover melody synth
+  const audioCtxRef = useRef(null)
+  const gainRef = useRef(null)
+  const melodyTimerRef = useRef(null)
+  const scaleRef = useRef([0, 2, 4, 7, 9]) // pentatonic in semitones
+
+  function getTvVolume() {
+    try {
+      const v = tvAudioRef.current?.volume
+      return typeof v === 'number' && v > 0 ? Math.min(1, v) : 0.45
+    } catch { return 0.45 }
+  }
+
+  function ensureAudio() {
+    try {
+      if (!audioCtxRef.current) {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)()
+        const gain = ctx.createGain()
+        gain.gain.value = getTvVolume()
+        gain.connect(ctx.destination)
+        audioCtxRef.current = ctx
+        gainRef.current = gain
+      }
+    } catch {}
+  }
+
+  function noteToFreq(midinote) {
+    return 440 * Math.pow(2, (midinote - 69) / 12)
+  }
+
+  function scheduleMelodyStart(seed = 0) {
+    try {
+      ensureAudio()
+      const ctx = audioCtxRef.current
+      const gain = gainRef.current
+      if (!ctx || !gain) return
+      // clear any prior loop
+      if (melodyTimerRef.current) { clearInterval(melodyTimerRef.current); melodyTimerRef.current = null }
+      // random but deterministic-ish per seed
+      let pr = (seed % 997) / 997
+      const rnd = () => { pr = (pr * 9301 + 49297) % 233280; return pr / 233280 }
+      const baseMidi = 64 // E4 base
+      // Align master gain with TV hover volume (smoothly)
+      try { gain.gain.setTargetAtTime(getTvVolume(), ctx.currentTime, 0.03) } catch {}
+      melodyTimerRef.current = setInterval(() => {
+        // 2-3 notes per second
+        const notes = 1 + Math.floor(rnd() * 2)
+        for (let i = 0; i < notes; i++) {
+          const step = scaleRef.current[Math.floor(rnd() * scaleRef.current.length)]
+          const octave = (rnd() < 0.5 ? 0 : 12)
+          const dur = 0.12 + rnd() * 0.18
+          const when = ctx.currentTime + 0.02 + i * (0.15 + rnd() * 0.1)
+          const freq = noteToFreq(baseMidi + step + octave)
+          const osc = ctx.createOscillator()
+          const g = ctx.createGain()
+          osc.type = 'triangle'
+          osc.frequency.value = freq
+          g.gain.setValueAtTime(0.0001, when)
+          g.gain.linearRampToValueAtTime(0.16, when + 0.02)
+          g.gain.exponentialRampToValueAtTime(0.0001, when + dur)
+          osc.connect(g)
+          g.connect(gain)
+          osc.start(when)
+          osc.stop(when + dur + 0.02)
+        }
+      }, 220)
+    } catch {}
+  }
+
+  function stopMelody() {
+    try { if (melodyTimerRef.current) { clearInterval(melodyTimerRef.current); melodyTimerRef.current = null } } catch {}
+    try { if (audioCtxRef.current) { /* allow GC */ } } catch {}
+    try { window.__stopCirclesMelody = () => { try { if (melodyTimerRef.current) clearInterval(melodyTimerRef.current); } catch {} } } catch {}
+  }
+  function seqHoverOn(seed) {
+    seqHoverCountRef.current += 1
+    setSeqHover(true)
+    scheduleMelodyStart(typeof seed === 'number' ? seed : 0)
+  }
+  function seqHoverOff() {
+    seqHoverCountRef.current = Math.max(0, seqHoverCountRef.current - 1)
+    if (seqHoverCountRef.current === 0) { setSeqHover(false); stopMelody() }
+  }
+  // Advance sequencer traveling pattern while hovering
+  useEffect(() => {
+    if (!seqHover) return
+    const intervalMs = 200 // ~800ms per full 4-column cycle
+    const id = setInterval(() => setSeqStep(s => s + 1), intervalMs)
+    return () => clearInterval(id)
+  }, [seqHover])
   // Build a set of userIds that are currently paired
   const pairedUserIds = new Set()
   pairs.forEach(({ a, b }) => {
@@ -166,6 +262,20 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
     }
 
     return place
+  }
+
+  // Deterministic placement around the Sequencer icon orbit
+  function placeSequencerOrbit(key) {
+    const h = hashString(String(key)) >>> 0
+    const seqX = worldWidth / 2 + 1080
+    const seqY = worldHeight / 2
+    const baseR = 200 // half icon size is 100; orbit just outside
+    const jitter = 80 + (h % 80) // 80..159 extra radius
+    const r = baseR + jitter
+    const ang = ((h / 37) % (Math.PI * 2))
+    const x = Math.round(seqX + Math.cos(ang) * r)
+    const y = Math.round(seqY + Math.sin(ang) * r)
+    return { x, y }
   }
 
   useEffect(() => {
@@ -521,7 +631,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
             title="Admin"
             style={{ left: '20px', top: '20px', width: '16px', height: '16px', background: '#ff2d2d', borderRadius: '50%', boxShadow: '0 0 8px rgba(255,45,45,0.8)' }}
           />)}
-            {/* Umbilical cords from TV to users currently on TV (rendered before TV to sit behind) */}
+            {/* Umbilical cords from TV to users currently on TV (rendered before TV to sit behind). Also draw Sequencer cords. */}
             <svg className="absolute inset-0 pointer-events-none" width={worldWidth} height={worldHeight} viewBox={`0 0 ${worldWidth} ${worldHeight}`}
               style={{ left: 0, top: 0 }}>
               {tvIds.map((uid) => {
@@ -536,6 +646,24 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                   <path key={`cord-${uid}`} d={d} fill="none" stroke={tvHover ? "url(#cordStatic)" : "#000"} strokeWidth="8" strokeLinecap="round" opacity={tvHover ? 1 : 0.9} vectorEffect="non-scaling-stroke" shapeRendering="geometricPrecision" />
                 )
               })}
+              {seqIds.map((uid) => {
+                const u = users.find(x => x.id === uid)
+                if (!u || uid === selfId) return null
+                const pos = placeSequencerOrbit(u.id)
+                const seqX = worldWidth/2 + 1080
+                const seqY = worldHeight/2
+                const d = buildWavePath(seqX, seqY, pos.x, pos.y)
+                const seed = (hashString(u.id) % 200)
+                const dashOffset = (animT * 120 + seed) % 200
+                return (
+                  <g key={`seqcord-${uid}`}>
+                    {/* base cord: black */}
+                    <path d={d} fill="none" stroke="#000" strokeWidth="8" strokeLinecap="round" opacity={0.95} vectorEffect="non-scaling-stroke" shapeRendering="geometricPrecision" />
+                    {/* hover overlay: pulsing yellow dashes that travel */}
+                    <path d={d} fill="none" stroke="url(#seqGold)" strokeWidth="7" strokeLinecap="round" opacity={seqHover ? 1 : 0} vectorEffect="non-scaling-stroke" shapeRendering="geometricPrecision" style={{ strokeDasharray: '2 18', strokeDashoffset: dashOffset }} />
+                  </g>
+                )
+              })}
               <defs>
                 <filter id="noiseFilter">
                   <feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="2" stitchTiles="stitch" />
@@ -543,6 +671,10 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                 <pattern id="cordStatic" patternUnits="userSpaceOnUse" width="20" height="20">
                   <rect width="20" height="20" filter="url(#noiseFilter)"/>
                 </pattern>
+                <linearGradient id="seqGold" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" stopColor="#ffd54a"/>
+                  <stop offset="100%" stopColor="#ff9f1a"/>
+                </linearGradient>
               </defs>
             </svg>
 
@@ -559,6 +691,39 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
               <div className="relative w-full h-full">
                 <div className="absolute inset-0 rounded-full bg-black overflow-hidden shadow">
                   <canvas ref={tvCanvasRef} className="w-full h-full block" />
+                </div>
+              </div>
+            </button>
+            {/* Sequencer icon placed near the TV circle (to the right, spaced) */}
+            <button
+              onClick={() => { try { seqHoverOff() } catch {}; try { stopMelody() } catch {}; try { window.__stopCirclesMelody = null } catch {}; onOpenSequencer?.() }}
+              className="absolute -translate-x-1/2 -translate-y-1/2 group hover:scale-105 transition"
+              style={{ left: (worldWidth/2 + 1080) + 'px', top: (worldHeight/2) + 'px', width: '200px', height: '200px', zIndex: 30 }}
+              aria-label="Open Sequencer"
+              title="Open Sequencer"
+              onMouseEnter={() => seqHoverOn(0)}
+              onMouseLeave={seqHoverOff}
+            >
+              <div className="relative w-full h-full grid place-items-center">
+                <div className="grid grid-cols-4 grid-rows-4 gap-[6px] p-3">
+                  {Array.from({ length: 16 }).map((_, i) => {
+                    const col = i % 4
+                    const row = Math.floor(i / 4)
+                    const baseLit = i % 5 === 0 || i === 7 || i === 10
+                    const travelingLit = (seqStep % 4) === col
+                    const lit = seqHover ? travelingLit : baseLit
+                    const base = 'w-4 h-4 rounded-sm transition-transform transition-colors duration-200 ease-out'
+                    const scale = seqHover && lit ? 'scale-110' : ''
+                    const color = lit ? 'bg-yellow-400 shadow-[0_0_8px_rgba(255,205,0,0.8)]' : 'bg-zinc-600'
+                    const delay = (col + row) * 30
+                    return (
+                      <div
+                        key={i}
+                        className={`${base} ${scale} ${color}`}
+                        style={{ transitionDelay: delay + 'ms' }}
+                      />
+                    )
+                  })}
                 </div>
               </div>
             </button>
@@ -594,7 +759,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                   })}
                   {others.filter(u => !pairedUserIds.has(u.id)).map((u) => {
                     const { color, lightness } = hashToGray(u.id)
-                    const pos = place(u.id)
+                    const pos = (Array.isArray(seqIds) && seqIds.includes(u.id)) ? placeSequencerOrbit(u.id) : place(u.id)
                     const t = timesMemo.single.get(u.id) || 0
                     const h = hoursFromMs(t)
                     const f = clamp01(h / HOURS_TO_MAX)
@@ -609,6 +774,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                     const baseCount = isAdmin ? 6 : 0
                     const tendrilCount = Math.max(0, Math.round(baseCount + tendrilProgress * (maxCount - baseCount)))
                     const lengthScale = 1 + 0.5 * tendrilProgress
+                    const isInSeq = Array.isArray(seqIds) && seqIds.includes(u.id)
                     return (
                       <button
                         key={u.id}
@@ -617,8 +783,8 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                         style={{ left: `${pos.x}px`, top: `${pos.y}px`, width: size + 'px', height: size + 'px', backgroundColor: isAdmin ? '#ff2d2d' : color, boxShadow: isAdmin ? '0 0 18px rgba(255,45,45,0.8)' : `0 0 12px ${color}`, overflow: 'visible' }}
                         title={inTV ? 'TV connected' : 'Start chat'}
                         aria-label={inTV ? 'TV connected' : 'Start chat'}
-                        onMouseEnter={inTV ? handleInTvEnter : onHoverStart}
-                        onMouseLeave={inTV ? handleInTvLeave : onHoverEnd}
+                        onMouseEnter={(e) => { if (inTV) handleInTvEnter(); else onHoverStart(); if (isInSeq) seqHoverOn(hashString(u.id)) }}
+                        onMouseLeave={(e) => { if (inTV) handleInTvLeave(); else onHoverEnd(); if (isInSeq) seqHoverOff() }}
                       >
                         {tendrilCount > 0 && (
                           <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" style={{ overflow: 'visible', zIndex: 0 }}>
@@ -661,7 +827,7 @@ export default function Circles({ selfId, users, pairs, timesBySocket = {}, pair
                   {/* Self circle when not in a pair (guard until selfId is known) */}
                   {selfId && !pairedUserIds.has(selfId) && (() => {
                     const place = makeClusterPlacer()
-                    const pos = place(selfId)
+                    const pos = (Array.isArray(seqIds) && seqIds.includes(selfId)) ? placeSequencerOrbit(selfId) : place(selfId)
                     const h = hoursFromMs(effectiveMsForSocket(selfId))
                     const f = clamp01(h / HOURS_TO_MAX)
                     const isAdmin = isAdminId(selfId)

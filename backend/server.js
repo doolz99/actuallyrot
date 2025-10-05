@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3001;
 
 const app = express();
 app.use(cors({ origin: '*'}));
+app.use(express.json({ limit: '10mb' }));
 // Timesync endpoint for NTP-like client clock sync
 app.use('/timesync', timesyncServer.requestHandler);
 
@@ -21,12 +22,65 @@ const io = new Server(server, {
   }
 });
 
+// Static uploads for SFX assets
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }) } catch {}
+app.use('/uploads', express.static(UPLOAD_DIR))
+
 // In-memory user store: socketId -> { id: string, partnerId: string | null }
 const users = new Map();
 // In-memory pairs store: pairKey (sorted "a|b") -> { a: string, b: string }
 const pairs = new Map();
 // Users currently in TV view: Set of socketIds
 const tvUsers = new Set();
+// Users currently on Sequencer page: Set of socketIds
+const seqUsers = new Set();
+// Global active song id shared by everyone on the sequencer page
+let activeSongId = 'default'
+// ---- Collaborative Sequencer: in-memory songs ----
+// song = { id, tempo, bars, stepsPerBar, lanes, grid, notes, playing, baseBar, baseTsMs, rev }
+const songs = new Map();
+function ensureSong(songId = 'default') {
+  if (!songs.has(songId)) {
+    // Prefer persisted version if it exists
+    const persisted = (songsStore && typeof songsStore === 'object') ? songsStore[songId] : null;
+    if (persisted && typeof persisted === 'object') {
+      const clone = JSON.parse(JSON.stringify(persisted));
+      if (!clone.id) clone.id = songId;
+      if (typeof clone.rev !== 'number') clone.rev = 1;
+      songs.set(songId, clone);
+    } else {
+      const bars = 4;
+      const stepsPerBar = 16;
+      const lanes = ['KICK', 'SNARE', 'HAT', 'CLAP'];
+      const total = bars * stepsPerBar;
+      const grid = Array.from({ length: lanes.length }, () => Array.from({ length: total }, () => false));
+      const notes = []; // piano roll notes: { id, startStep, lengthSteps, pitch, velocity }
+      songs.set(songId, {
+        id: songId,
+        tempo: 120,
+        bars,
+        stepsPerBar,
+        lanes,
+        grid,
+        notes,
+        patterns: [{ id: 'p1', name: 'Pattern 1', bars: 4, notes: [] }],
+        activePatternId: 'p1',
+        clips: [], // arrangement clips: { id, track, startStep, lengthSteps }
+        sfx: [],   // sfx events: { id, track, startStep, lengthSteps, url, gain, pan, offsetMs }
+        playing: false,
+        baseBar: 0,
+        baseTsMs: Date.now(),
+        // Shared loop state
+        loopOn: false,
+        loopStartStep: 0,
+        loopEndStep: 0,
+        rev: 1,
+      });
+    }
+  }
+  return songs.get(songId);
+}
 // Pair rot state: pairKey -> { state: 'red'|'blue'|'none', updatedAtMs: number }
 const pairRotState = new Map();
 const ROT_TTL_MS = 7000;
@@ -121,6 +175,51 @@ function ensureDevice(deviceId) {
 
 loadTimesFromDisk();
 
+// ---- Songs persistence (simple JSON store) ----
+const SONGS_PATH = path.join(__dirname, 'songs.json');
+let songsStore = {};
+try {
+  if (fs.existsSync(SONGS_PATH)) {
+    const raw = JSON.parse(fs.readFileSync(SONGS_PATH, 'utf8'))
+    if (raw && typeof raw === 'object') songsStore = raw
+  }
+} catch {}
+function saveSongsToDisk() {
+  try { fs.writeFileSync(SONGS_PATH, JSON.stringify(songsStore, null, 2), 'utf8') } catch {}
+}
+
+// REST endpoints to save/load songs
+app.get('/songs', (_req, res) => {
+  try {
+    const memIds = Array.from(songs.keys ? songs.keys() : [])
+    const fileIds = Object.keys(songsStore)
+    const ids = Array.from(new Set([...(memIds||[]), ...(fileIds||[])]))
+    res.json({ ids })
+  } catch { res.status(500).json({ error: 'failed' }) }
+});
+app.get('/songs/:id', (req, res) => {
+  try {
+    const id = String(req.params.id||'').trim();
+    if (!id) return res.status(400).json({ error: 'missing id' })
+    const s = songsStore[id] || null
+    if (!s) return res.status(404).json({ error: 'not_found' })
+    return res.json({ song: s })
+  } catch { return res.status(500).json({ error: 'failed' }) }
+});
+app.put('/songs/:id', (req, res) => {
+  try {
+    const id = String(req.params.id||'').trim();
+    const body = req.body||{}
+    const song = body.song
+    if (!id || !song || typeof song !== 'object') return res.status(400).json({ error: 'bad_request' })
+    songsStore[id] = song
+    saveSongsToDisk()
+    // Update in-memory active snapshot for that id
+    songs.set(id, song)
+    return res.json({ ok: true })
+  } catch { return res.status(500).json({ error: 'failed' }) }
+});
+
 app.get('/', (_req, res) => {
   res.send('Chat backend is running');
 });
@@ -135,6 +234,14 @@ io.on('connection', (socket) => {
   socket.emit('pinups', { list: pinups });
   // Send current TV users snapshot
   socket.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+  // Send current Sequencer users snapshot
+  socket.emit('seq_snapshot', { ids: Array.from(seqUsers) });
+  // Send default song snapshot for convenience
+  try {
+    const s = ensureSong('default');
+    socket.emit('seq_song', { song: s, rev: s.rev });
+    socket.emit('seq_transport', { songId: s.id, playing: s.playing, baseBar: s.baseBar, baseTsMs: s.baseTsMs, tempo: s.tempo });
+  } catch {}
   // Send current live flag
   socket.emit('tv_live', { on: tvLive });
 
@@ -265,6 +372,367 @@ io.on('connection', (socket) => {
     try {
       if (inTv) tvUsers.add(socket.id); else tvUsers.delete(socket.id);
       io.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+    } catch {}
+  });
+
+  // Sequencer state (user enters/exits Sequencer view)
+  socket.on('seq_state', ({ inSeq }) => {
+    try {
+      if (inSeq) seqUsers.add(socket.id); else seqUsers.delete(socket.id);
+      io.emit('seq_snapshot', { ids: Array.from(seqUsers) });
+    } catch {}
+  });
+
+  // Sequencer: join a song room and receive snapshot
+  socket.on('seq_join', ({ songId }) => {
+    try {
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : (activeSongId || 'default');
+      const song = ensureSong(id);
+      socket.join(`seq:${id}`);
+      io.to(socket.id).emit('seq_song', { song, rev: song.rev });
+      io.to(socket.id).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo });
+    } catch {}
+  });
+
+  // Sequencer: switch active song globally for all clients
+  socket.on('seq_switch_song', ({ id }) => {
+    try {
+      const nextId = (typeof id === 'string' && id.trim()) ? id.trim() : 'default'
+      activeSongId = nextId
+      const song = ensureSong(nextId)
+      // Move everyone to the new room and send snapshot
+      for (const [sid, sock] of io.sockets.sockets) {
+        try {
+          const rooms = Array.from(sock.rooms || [])
+          for (const r of rooms) { if (r.startsWith('seq:')) sock.leave(r) }
+          sock.join(`seq:${nextId}`)
+          io.to(sid).emit('seq_song', { song, rev: song.rev })
+          io.to(sid).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo })
+        } catch {}
+      }
+      // Announce selection change so UIs update their displayed song id if needed
+      io.emit('seq_active_song', { id: nextId })
+    } catch {}
+  })
+
+  // Sequencer: admin delete a song by id
+  socket.on('seq_delete_song', ({ id }) => {
+    try {
+      if (!adminSockets.has(socket.id)) return;
+      const delId = (typeof id === 'string' && id.trim()) ? id.trim() : '';
+      if (!delId || delId === 'default') return;
+      // Remove from persisted store and memory
+      if (songsStore && Object.prototype.hasOwnProperty.call(songsStore, delId)) {
+        delete songsStore[delId];
+        saveSongsToDisk();
+      }
+      if (songs.has(delId)) songs.delete(delId);
+      // If deleting the active song, switch everyone back to default
+      if (activeSongId === delId) {
+        activeSongId = 'default';
+        const song = ensureSong(activeSongId);
+        for (const [sid, sock] of io.sockets.sockets) {
+          try {
+            const rooms = Array.from(sock.rooms || [])
+            for (const r of rooms) { if (r.startsWith('seq:')) sock.leave(r) }
+            sock.join(`seq:${activeSongId}`)
+            io.to(sid).emit('seq_song', { song, rev: song.rev })
+            io.to(sid).emit('seq_transport', { songId: song.id, playing: song.playing, baseBar: song.baseBar, baseTsMs: song.baseTsMs, tempo: song.tempo })
+          } catch {}
+        }
+        io.emit('seq_active_song', { id: activeSongId })
+      }
+      // Optionally notify clients so they can refresh lists
+      io.emit('songs_changed', { at: Date.now() })
+    } catch {}
+  })
+
+  // Sequencer: apply ops
+  socket.on('seq_ops', ({ songId, parentRev, ops }) => {
+    try {
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
+      const song = ensureSong(id);
+      if (!Array.isArray(ops)) return;
+      // Be tolerant of parentRev mismatches to avoid dropping edits from other tabs
+      // (we still send the latest snapshot below for clients to converge).
+      let changed = false;
+      let structural = false;
+      for (const op of ops) {
+        if (!op || typeof op !== 'object') continue;
+        if (op.type === 'toggle_step') {
+          const lane = Math.max(0, Math.min(song.lanes.length - 1, Number(op.lane)));
+          const step = Math.max(0, Math.min(song.bars * song.stepsPerBar - 1, Number(op.step)));
+          if (Number.isFinite(lane) && Number.isFinite(step)) {
+            song.grid[lane][step] = !song.grid[lane][step];
+            changed = true;
+          }
+        } else if (op.type === 'set_tempo') {
+          const t = Number(op.tempo);
+          if (isFinite(t) && t >= 40 && t <= 240) { song.tempo = Math.round(t); changed = true; }
+        } else if (op.type === 'note_add') {
+          const ns = {
+            id: typeof op.id === 'string' ? op.id : Date.now().toString(36) + Math.random().toString(36).slice(2),
+            startStep: Math.max(0, Math.min(song.bars * song.stepsPerBar, Number(op.startStep) || 0)),
+            lengthSteps: Math.max(1, Math.min(song.stepsPerBar * song.bars, Number(op.lengthSteps) || 1)),
+            pitch: Math.max(21, Math.min(108, Number(op.pitch) || 60)),
+            velocity: Math.max(0.05, Math.min(1, Number(op.velocity) || 0.8)),
+            synth: typeof op.synth === 'string' ? op.synth : 'Triangle',
+          };
+          const pid = typeof op.patternId === 'string' ? op.patternId : song.activePatternId;
+          const pat = Array.isArray(song.patterns) ? song.patterns.find(p => p.id === pid) : null;
+          if (pat) { pat.notes.push(ns); changed = true; structural = true; } else { song.notes.push(ns); changed = true; }
+        } else if (op.type === 'note_delete') {
+          const idstr = String(op.id || '');
+          let affected = false;
+          if (Array.isArray(song.patterns)) {
+            for (const p of song.patterns) {
+              const beforeP = p.notes.length;
+              p.notes = p.notes.filter(n => n.id !== idstr);
+              if (p.notes.length !== beforeP) { affected = true; structural = true; }
+            }
+          }
+          const before = song.notes.length;
+          song.notes = song.notes.filter(n => n.id !== idstr);
+          if (song.notes.length !== before) affected = true;
+          if (affected) changed = true;
+        } else if (op.type === 'note_update') {
+          const idstr = String(op.id || '');
+          let n = song.notes.find(x => x.id === idstr);
+          if (!n && Array.isArray(song.patterns)) {
+            for (const p of song.patterns) { const hit = p.notes.find(x => x.id === idstr); if (hit) { n = hit; break; } }
+          }
+          if (n) {
+            const total = song.bars * song.stepsPerBar;
+            if (op.startStep !== undefined) n.startStep = Math.max(0, Math.min(total, Number(op.startStep) || 0));
+            if (op.lengthSteps !== undefined) n.lengthSteps = Math.max(1, Math.min(total - n.startStep, Number(op.lengthSteps) || 1));
+            if (op.pitch !== undefined) n.pitch = Math.max(21, Math.min(108, Number(op.pitch) || 60));
+            if (op.velocity !== undefined) n.velocity = Math.max(0.05, Math.min(1, Number(op.velocity) || 0.8));
+            if (op.synth !== undefined && typeof op.synth === 'string') n.synth = op.synth;
+            changed = true; structural = true;
+          }
+        } else if (op.type === 'pattern_add') {
+          const id = typeof op.id === 'string' ? op.id : ('p' + Date.now().toString(36) + Math.random().toString(36).slice(2));
+          const name = typeof op.name === 'string' ? op.name : 'Pattern';
+          const barsP = Math.max(1, Math.min(256, Number(op.bars) || 4));
+          if (!song.patterns) song.patterns = [];
+          song.patterns.push({ id, name, bars: barsP, notes: [] }); song.activePatternId = id; changed = true; structural = true;
+        } else if (op.type === 'pattern_update') {
+          const pid = String(op.id||'');
+          const p = Array.isArray(song.patterns) ? song.patterns.find(x=>x.id===pid) : null;
+          if (p) {
+            if (typeof op.name === 'string') p.name = op.name;
+            if (op.bars !== undefined) p.bars = Math.max(1, Math.min(256, Number(op.bars)||p.bars));
+            changed = true; structural = true;
+          }
+        } else if (op.type === 'pattern_delete') {
+          const pid = String(op.id||'');
+          if (Array.isArray(song.patterns)) {
+            const before = song.patterns.length;
+            song.patterns = song.patterns.filter(p=>p.id!==pid);
+            if (before !== song.patterns.length) { changed = true; structural = true; if (song.activePatternId === pid) song.activePatternId = song.patterns[0]?.id || null }
+          }
+        } else if (op.type === 'pattern_select') {
+          const pid = String(op.id||'');
+          if (Array.isArray(song.patterns) && song.patterns.find(p=>p.id===pid)) { song.activePatternId = pid; changed = true; }
+        } else if (op.type === 'clip_add') {
+          const total = song.bars * song.stepsPerBar;
+          const c = {
+            id: typeof op.id === 'string' ? op.id : Date.now().toString(36) + Math.random().toString(36).slice(2),
+            track: Math.max(0, Math.min(3, Number(op.track) || 0)),
+            startStep: Math.max(0, Math.min(total, Number(op.startStep) || 0)),
+            lengthSteps: Math.max(1, Math.min(total, Number(op.lengthSteps) || song.stepsPerBar * 4)),
+            patternId: typeof op.patternId === 'string' ? op.patternId : (song.activePatternId || 'p1')
+          };
+          song.clips.push(c); changed = true; structural = true;
+        } else if (op.type === 'clip_update') {
+          const idstr = String(op.id || '');
+          const c = song.clips.find(x => x.id === idstr);
+          if (c) {
+            const total = song.bars * song.stepsPerBar;
+            if (op.track !== undefined) c.track = Math.max(0, Math.min(3, Number(op.track)));
+            if (op.startStep !== undefined) c.startStep = Math.max(0, Math.min(total, Number(op.startStep) || 0));
+            if (op.lengthSteps !== undefined) c.lengthSteps = Math.max(1, Math.min(total - c.startStep, Number(op.lengthSteps) || 1));
+            if (op.patternId !== undefined && typeof op.patternId === 'string') c.patternId = op.patternId;
+            changed = true; structural = true;
+          }
+        } else if (op.type === 'clip_delete') {
+          const idstr = String(op.id || '');
+          const before = song.clips.length;
+          song.clips = song.clips.filter(c => c.id !== idstr);
+          if (song.clips.length !== before) { changed = true; structural = true; }
+        } else if (op.type === 'sfx_add') {
+          const total = song.bars * song.stepsPerBar;
+          const s = {
+            id: typeof op.id === 'string' ? op.id : Date.now().toString(36) + Math.random().toString(36).slice(2),
+            track: Math.max(0, Math.min(3, Number(op.track) || 0)),
+            startStep: Math.max(0, Math.min(total, Number(op.startStep) || 0)),
+            lengthSteps: Math.max(1, Math.min(total, Number(op.lengthSteps) || 1)),
+            url: typeof op.url === 'string' ? op.url : '',
+            gain: (typeof op.gain === 'number' && isFinite(op.gain)) ? Math.max(0, Math.min(1, op.gain)) : 1,
+            pan: (typeof op.pan === 'number' && isFinite(op.pan)) ? Math.max(-1, Math.min(1, op.pan)) : 0,
+            offsetMs: (typeof op.offsetMs === 'number' && isFinite(op.offsetMs)) ? Math.max(0, op.offsetMs) : 0,
+          };
+          song.sfx.push(s); changed = true; structural = true;
+        } else if (op.type === 'sfx_update') {
+          const idstr = String(op.id || '');
+          const s = song.sfx.find(x => x.id === idstr);
+          if (s) {
+            const total = song.bars * song.stepsPerBar;
+            if (op.track !== undefined) s.track = Math.max(0, Math.min(3, Number(op.track)));
+            if (op.startStep !== undefined) s.startStep = Math.max(0, Math.min(total, Number(op.startStep) || 0));
+            if (op.lengthSteps !== undefined) s.lengthSteps = Math.max(1, Math.min(total - s.startStep, Number(op.lengthSteps) || 1));
+            if (op.url !== undefined && typeof op.url === 'string') s.url = op.url;
+            if (op.gain !== undefined && isFinite(Number(op.gain))) s.gain = Math.max(0, Math.min(1, Number(op.gain)));
+            if (op.pan !== undefined && isFinite(Number(op.pan))) s.pan = Math.max(-1, Math.min(1, Number(op.pan)));
+            if (op.offsetMs !== undefined && isFinite(Number(op.offsetMs))) s.offsetMs = Math.max(0, Number(op.offsetMs));
+            changed = true; structural = true;
+          }
+        } else if (op.type === 'sfx_delete') {
+          const idstr = String(op.id || '');
+          const before = song.sfx.length;
+          song.sfx = song.sfx.filter(c => c.id !== idstr);
+          if (song.sfx.length !== before) { changed = true; structural = true; }
+        } else if (op.type === 'set_loop') {
+          const total = song.bars * song.stepsPerBar;
+          const on = !!op.on;
+          let a = Math.max(0, Math.min(total, Number(op.startStep) || 0));
+          let b = Math.max(0, Math.min(total, Number(op.endStep) || 0));
+          if (b < a) { const t = a; a = b; b = t; }
+          // Allow zero-length interim while dragging; UI should clamp to >=1 when finalizing
+          song.loopOn = on;
+          song.loopStartStep = a;
+          song.loopEndStep = b;
+          changed = true; structural = true;
+        } else if (op.type === 'set_bars') {
+          const nb = Math.max(1, Math.min(1000, Number(op.bars) || song.bars));
+          if (nb !== song.bars) {
+            const totalOld = song.bars * song.stepsPerBar;
+            const totalNew = nb * song.stepsPerBar;
+            // resize grid
+            song.grid = song.grid.map(row => {
+              const copy = row.slice(0, totalNew);
+              while (copy.length < totalNew) copy.push(false);
+              return copy;
+            });
+            // clamp notes within new length
+            song.notes = song.notes.map(n => ({
+              ...n,
+              startStep: Math.max(0, Math.min(totalNew - 1, n.startStep)),
+              lengthSteps: Math.max(1, Math.min(totalNew - n.startStep, n.lengthSteps))
+            }));
+            // clamp clips and sfx within new length
+            song.clips = (song.clips || []).map(c => ({
+              ...c,
+              startStep: Math.max(0, Math.min(totalNew - 1, c.startStep)),
+              lengthSteps: Math.max(1, Math.min(totalNew - c.startStep, c.lengthSteps))
+            }));
+            song.sfx = (song.sfx || []).map(s => ({
+              ...s,
+              startStep: Math.max(0, Math.min(totalNew - 1, s.startStep)),
+              lengthSteps: Math.max(1, Math.min(totalNew - s.startStep, s.lengthSteps))
+            }));
+            song.bars = nb; changed = true;
+            structural = true;
+          }
+        }
+      }
+      if (changed) {
+        song.rev += 1;
+        io.to(`seq:${id}`).emit('seq_apply', { ops, rev: song.rev });
+        // For structural changes like bars, also send a fresh snapshot to guarantee UI updates
+        const hasBars = Array.isArray(ops) && ops.some(o => o && o.type === 'set_bars')
+        if (hasBars || structural) {
+          io.to(`seq:${id}`).emit('seq_song', { song, rev: song.rev });
+        }
+      }
+    } catch {}
+  });
+
+  // Sequencer: collaborative page cursor (volatile)
+  socket.on('seq_cursor', ({ songId, cursor }) => {
+    try {
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
+      if (!cursor || typeof cursor !== 'object') return;
+      const nx = Number(cursor.nx);
+      const ny = Number(cursor.ny);
+      const sect = typeof cursor.sect === 'string' ? cursor.sect : undefined;
+      const sx = Number(cursor.sx);
+      const sy = Number(cursor.sy);
+      const payload = {
+        from: socket.id,
+        ts: Date.now(),
+        nx: isFinite(nx) ? Math.max(0, Math.min(1, nx)) : undefined,
+        ny: isFinite(ny) ? Math.max(0, Math.min(1, ny)) : undefined,
+        sect,
+        sx: isFinite(sx) ? Math.max(0, Math.min(1, sx)) : undefined,
+        sy: isFinite(sy) ? Math.max(0, Math.min(1, sy)) : undefined,
+        track: (typeof cursor.track === 'number' && isFinite(cursor.track)) ? Math.round(Math.max(0, Math.min(3, Number(cursor.track)))) : undefined,
+        ty: (typeof cursor.ty === 'number' && isFinite(cursor.ty)) ? Math.max(0, Math.min(1, Number(cursor.ty))) : undefined,
+      };
+      socket.to(`seq:${id}`).volatile.emit('seq_cursor', payload);
+    } catch {}
+  });
+
+  // SFX upload: client sends base64 data URL or raw base64; server saves and returns URL
+  socket.on('sfx_upload', async ({ songId, name, dataBase64 }) => {
+    try {
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
+      ensureSong(id);
+      let raw = String(dataBase64 || '');
+      const m = raw.match(/^data:[^;]+;base64,(.*)$/);
+      if (m) raw = m[1];
+      if (!raw) return;
+      const buf = Buffer.from(raw, 'base64');
+      const safeName = String(name || 'sfx').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
+      const ext = (safeName.includes('.') ? safeName.split('.').pop() : 'dat');
+      const filename = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const outPath = path.join(UPLOAD_DIR, filename);
+      fs.writeFileSync(outPath, buf);
+      const url = `/uploads/${filename}`;
+      io.to(socket.id).emit('sfx_uploaded', { name: safeName, url });
+    } catch {}
+  });
+
+  // Sequencer: transport control
+  socket.on('seq_transport', ({ songId, playing, positionBars, tempo, shared }) => {
+    try {
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
+      const song = ensureSong(id);
+      const now = Date.now();
+      // Keep tempo shared, but keep play/pause and position per-user
+      if (typeof tempo === 'number' && tempo >= 40 && tempo <= 240) song.tempo = Math.round(tempo);
+      const payload = {
+        songId: song.id,
+        playing: !!playing,
+        baseBar: (typeof positionBars === 'number' && isFinite(positionBars)) ? Math.max(0, positionBars) : song.baseBar,
+        baseTsMs: now,
+        tempo: song.tempo,
+        from: socket.id,
+      };
+      if (shared) {
+        // Broadcast to all in the song room (including sender)
+        io.to(`seq:${id}`).emit('seq_transport', payload);
+      } else {
+        // Echo ONLY to the requesting socket so transport is independent per user
+        io.to(socket.id).emit('seq_transport', payload);
+      }
+    } catch {}
+  });
+
+  // Sequencer: typing preview (volatile, room-scoped)
+  socket.on('seq_typing_preview', ({ songId, text, nx, ny }) => {
+    try {
+      const id = typeof songId === 'string' && songId.trim() ? songId.trim() : 'default';
+      const t = typeof text === 'string' ? text.slice(0, 140) : '';
+      const x = Number(nx), y = Number(ny);
+      const payload = {
+        id: socket.id,
+        text: t,
+        nx: isFinite(x) ? Math.max(0, Math.min(1, x)) : undefined,
+        ny: isFinite(y) ? Math.max(0, Math.min(1, y)) : undefined,
+        ts: Date.now(),
+      };
+      socket.to(`seq:${id}`).volatile.emit('seq_typing_preview', payload);
     } catch {}
   });
 
@@ -504,6 +972,9 @@ io.on('connection', (socket) => {
     socketActivity.delete(socket.id);
     if (tvUsers.delete(socket.id)) {
       io.emit('tv_snapshot', { ids: Array.from(tvUsers) });
+    }
+    if (seqUsers.delete(socket.id)) {
+      io.emit('seq_snapshot', { ids: Array.from(seqUsers) });
     }
     dndUsers.delete(socket.id);
     adminSockets.delete(socket.id);

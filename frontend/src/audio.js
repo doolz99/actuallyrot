@@ -134,4 +134,44 @@ export function playDisconnectSound() {
   o.stop(now + 0.22)
 }
 
+// Optional GM soundfont instruments (lazy-loaded). Falls back silently if unavailable.
+let _sfModule = null
+const _sfCache = new Map()
+export let sfLoaded = false
 
+export async function ensureSoundfontInstrument(name) {
+  if (!name) name = 'acoustic_grand_piano'
+  if (_sfCache.has(name)) return _sfCache.get(name)
+  try {
+    // Try local dependency first, then CDN fallback
+    _sfModule = _sfModule || await import('soundfont-player').catch(() => import('https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.es.js'))
+    const ctx = getCtx()
+    const inst = await _sfModule.instrument(ctx, name, { gain: 0.7 })
+    _sfCache.set(name, inst)
+    sfLoaded = true
+    return inst
+  } catch (e) {
+    sfLoaded = false
+    return null
+  }
+}
+
+// Play a MIDI note via a GM soundfont instrument (default: acoustic piano)
+export function playSf(midi, when = 0, durationSec = 1.5, gain = 0.8, instrument = 'acoustic_grand_piano') {
+  try {
+    const ctx = getCtx()
+    // non-blocking warmup
+    if (!_sfCache.has(instrument)) { ensureSoundfontInstrument(instrument) }
+    const inst = _sfCache.get(instrument)
+    if (inst && inst.play) {
+      const start = Math.max(ctx.currentTime, when)
+      const node = inst.play(midi, start, { duration: Math.max(0.05, durationSec), gain })
+      return node // has .stop()
+    }
+  } catch {}
+  return null
+}
+
+export function stopSfNode(node) {
+  try { if (node && node.stop) node.stop(0) } catch {}
+}

@@ -156,6 +156,18 @@ export async function ensureSoundfontInstrument(name) {
   }
 }
 
+// Load a GM instrument for a provided AudioContext/OfflineAudioContext (no shared cache)
+export async function ensureSoundfontInstrumentForContext(ctx, name) {
+  try {
+    if (!name) name = 'acoustic_grand_piano'
+    _sfModule = _sfModule || await import('soundfont-player').catch(() => import('https://cdn.jsdelivr.net/npm/soundfont-player@0.12.0/dist/soundfont-player.es.js'))
+    const inst = await _sfModule.instrument(ctx, name, { gain: 0.7 })
+    return inst
+  } catch {
+    return null
+  }
+}
+
 // Play a MIDI note via a GM soundfont instrument (default: acoustic piano)
 export function playSf(midi, when = 0, durationSec = 1.5, gain = 0.8, instrument = 'acoustic_grand_piano') {
   try {
@@ -174,4 +186,9 @@ export function playSf(midi, when = 0, durationSec = 1.5, gain = 0.8, instrument
 
 export function stopSfNode(node) {
   try { if (node && node.stop) node.stop(0) } catch {}
+}
+
+export function midiToFreq(midi) {
+  const m = Math.max(0, Math.min(127, Number(midi)||60))
+  return 440 * Math.pow(2, (m - 69) / 12)
 }

@@ -4,6 +4,7 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const timesyncServer = require('timesync/server');
 
 const PORT = process.env.PORT || 3001;
@@ -218,6 +219,35 @@ app.put('/songs/:id', (req, res) => {
     songs.set(id, song)
     return res.json({ ok: true })
   } catch { return res.status(500).json({ error: 'failed' }) }
+});
+
+// Transcode uploaded webm/opus (base64 data URL or raw base64) to mp3; requires ffmpeg installed on server
+app.post('/convert/mp3', async (req, res) => {
+  try {
+    const raw = String((req.body && req.body.data) || '');
+    let b64 = raw;
+    const m = b64.match(/^data:[^;]+;base64,(.*)$/);
+    if (m) b64 = m[1];
+    if (!b64) return res.status(400).json({ error: 'missing_data' });
+    const buf = Buffer.from(b64, 'base64');
+    const tmpDir = path.join(__dirname, 'tmp');
+    try { fs.mkdirSync(tmpDir, { recursive: true }) } catch {}
+    const inPath = path.join(tmpDir, `${Date.now().toString(36)}_in.webm`);
+    const outPath = path.join(tmpDir, `${Date.now().toString(36)}_out.mp3`);
+    fs.writeFileSync(inPath, buf);
+    await new Promise((resolve, reject) => {
+      const p = spawn('ffmpeg', ['-y', '-i', inPath, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', outPath]);
+      p.on('error', reject);
+      p.on('exit', (code) => code === 0 ? resolve() : reject(new Error('ffmpeg_exit_' + code)));
+    });
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'attachment; filename="song.mp3"');
+    const stream = fs.createReadStream(outPath);
+    stream.on('close', () => { try { fs.unlinkSync(inPath) } catch {}; try { fs.unlinkSync(outPath) } catch {} });
+    stream.pipe(res);
+  } catch (e) {
+    return res.status(500).json({ error: 'failed' });
+  }
 });
 
 app.get('/', (_req, res) => {

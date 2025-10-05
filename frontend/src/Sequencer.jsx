@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { colorForKey } from './color'
-import { playSf, ensureSoundfontInstrument, sfLoaded, stopSfNode } from './audio'
+import { playSf, ensureSoundfontInstrument, sfLoaded, stopSfNode, ensureSoundfontInstrumentForContext, midiToFreq } from './audio'
 
 export default function Sequencer({ socket, onBack }) {
   const BACKEND_URL = (import.meta.env && import.meta.env.VITE_BACKEND_URL) ? String(import.meta.env.VITE_BACKEND_URL) : 'http://localhost:3001'
@@ -181,6 +181,217 @@ export default function Sequencer({ socket, onBack }) {
       if (!id) return
       setSongSaveId(id)
       try { socket?.emit?.('seq_switch_song', { id }) } catch {}
+    } catch {}
+  }
+  async function exportSongMp3() {
+    try {
+      const ctx = audioCtxRef.current
+      const master = masterRef.current
+      if (!ctx || !master || !song) return
+      try { await ctx.resume?.() } catch {}
+      const dest = ctx.createMediaStreamDestination()
+      try { master.connect(dest) } catch {}
+      const typeMp3 = (typeof window !== 'undefined' && window.MediaRecorder && window.MediaRecorder.isTypeSupported && window.MediaRecorder.isTypeSupported('audio/mpeg'))
+      const mime = typeMp3 ? 'audio/mpeg' : (window.MediaRecorder && window.MediaRecorder.isTypeSupported && window.MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm')
+      const rec = new MediaRecorder(dest.stream, { mimeType: mime })
+      const chunks = []
+      rec.ondataavailable = (e) => { if (e && e.data && e.data.size > 0) chunks.push(e.data) }
+      const prevPlaying = playing
+      const prevBase = baseBar
+      const prevTs = baseTsMs
+      const totalSec = Math.max(1, (Number(song.bars)||4) * 4 * (60 / Math.max(40, Math.min(240, Number(tempo)||120)))) + 0.6
+      rec.start()
+      // If not already playing, play from start for export duration
+      if (!prevPlaying) {
+        try {
+          setBaseBar(0); setBaseTsMs(Date.now()); schedRef.current.nextStep = 0
+          setPlaying(true); ensureAudio(); ctx.resume?.(); scheduleWindow?.(true)
+        } catch {}
+      }
+      await new Promise(r => setTimeout(r, Math.ceil(totalSec * 1000)))
+      try { setPlaying(false) } catch {}
+      await new Promise(resolve => { rec.onstop = () => resolve(); rec.stop() })
+      try { master.disconnect(dest) } catch {}
+      // Blob export; if MP3 not supported, send to backend to convert
+      const blob = new Blob(chunks, { type: mime })
+      if (typeMp3) {
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `${String(song.id||'song')}.mp3`
+        document.body.appendChild(a)
+        a.click()
+        setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url) } catch {} }, 1500)
+      } else {
+        const reader = new FileReader()
+        reader.onloadend = async () => {
+          try {
+            const b64 = String(reader.result||'')
+            const res = await fetch(`${BACKEND_URL.replace(/\/$/, '')}/convert/mp3`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: b64 }) })
+            if (!res.ok) throw new Error('convert_failed')
+            const blobMp3 = await res.blob()
+            const url = URL.createObjectURL(blobMp3)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `${String(song.id||'song')}.mp3`
+            document.body.appendChild(a)
+            a.click()
+            setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url) } catch {} }, 1500)
+          } catch {}
+        }
+        reader.readAsDataURL(blob)
+      }
+      // Restore previous transport if it was playing
+      if (prevPlaying) {
+        try { setBaseBar(prevBase); setBaseTsMs(prevTs); setPlaying(true); scheduleWindow?.(true) } catch {}
+      }
+    } catch {}
+  }
+
+  async function exportSongOffline() {
+    try {
+      if (!song) return
+      const stepsPerBar = Number(song.stepsPerBar)||16
+      const bars = Number(song.bars)||4
+      const bpm = Math.max(40, Math.min(240, Number(tempo)||120))
+      const secondsPerStep = (60 / bpm) * 4 / stepsPerBar
+      const pats = Array.isArray(song.patterns) ? song.patterns : []
+      const clips = Array.isArray(song.clips) ? song.clips : []
+      const arr = []
+      let lastEndStep = 0
+      for (const c of clips) {
+        const pat = pats.find(p=>p.id===c.patternId)
+        if (!pat) continue
+        const clipStart = Math.max(0, Number(c.startStep||0))
+        const clipLen = Math.max(1, Number(c.lengthSteps|| (stepsPerBar*4)))
+        const clipEnd = clipStart + clipLen
+        const patBars = Math.max(1, Number(pat.bars||4))
+        const patSteps = patBars * stepsPerBar
+        if (patSteps <= 0) continue
+        for (const n of (pat.notes||[])) {
+          const nStartLocal = Math.max(0, Number(n.startStep||0))
+          const nLen = Math.max(1, Number(n.lengthSteps||1))
+          // Find the first repeat k such that occStart >= clipStart - patSteps
+          let k = Math.floor((clipStart - (clipStart + nStartLocal)) / patSteps)
+          if (!isFinite(k)) k = 0
+          // Loop through repeats while start < clipEnd
+          for (; ; k++) {
+            const occStart = clipStart + k*patSteps + nStartLocal
+            if (occStart >= clipEnd) break
+            const occEnd = occStart + nLen
+            if (occEnd <= clipStart) continue
+            const trimmedStart = Math.max(occStart, clipStart)
+            const trimmedEnd = Math.min(occEnd, clipEnd)
+            const trimmedLen = Math.max(1, Math.round(trimmedEnd - trimmedStart))
+            arr.push({
+              startStepAbs: trimmedStart,
+              lengthSteps: trimmedLen,
+              velocity: Number(n.velocity||0.8),
+              pitch: Number(n.pitch||60),
+              synth: String(n.synth||'Triangle')
+            })
+            if (trimmedEnd > lastEndStep) lastEndStep = trimmedEnd
+          }
+        }
+      }
+      // Fallback to top-level notes if any
+      for (const n of (song.notes||[])) {
+        const ss = Number(n.startStep||0)
+        const ll = Math.max(1, Number(n.lengthSteps||1))
+        arr.push({ startStepAbs: ss, lengthSteps: ll, velocity: Number(n.velocity||0.8), pitch: Number(n.pitch||60), synth: String(n.synth||'Triangle') })
+        if ((ss + ll) > lastEndStep) lastEndStep = ss + ll
+      }
+      // Determine total duration by last event, with small tail
+      const baseSteps = bars * stepsPerBar
+      const endSteps = Math.max(baseSteps, Math.ceil(lastEndStep))
+      const durationSec = endSteps * secondsPerStep + 1.0
+      const sampleRate = 44100
+      const offline = new OfflineAudioContext(2, Math.ceil(durationSec * sampleRate), sampleRate)
+      const master = offline.createGain(); master.gain.setValueAtTime(1, 0); master.connect(offline.destination)
+      // Group SF instrument instances per name
+      const sfInstCache = new Map()
+      async function getSf(name) {
+        if (sfInstCache.has(name)) return sfInstCache.get(name)
+        const inst = await ensureSoundfontInstrumentForContext(offline, name)
+        sfInstCache.set(name, inst)
+        return inst
+      }
+      for (const ev of arr) {
+        const start = Math.max(0, ev.startStepAbs * secondsPerStep)
+        const dur = Math.max(0.05, ev.lengthSteps * secondsPerStep)
+        const end = start + dur
+        const vel = Math.max(0.01, Math.min(1, ev.velocity))
+        if (ev.synth && ev.synth.startsWith && ev.synth.startsWith('SF:')) {
+          const name = ev.synth.slice(3)
+          const inst = await getSf(name)
+          if (inst && inst.play) inst.play(ev.pitch, start, { duration: dur + 0.05, gain: vel })
+        } else if (['PianoSF','StringsSF','BassSF','EPianoSF','ChoirSF'].includes(ev.synth)) {
+          const map = { PianoSF:'acoustic_grand_piano', StringsSF:'string_ensemble_1', BassSF:'acoustic_bass', EPianoSF:'electric_piano_1', ChoirSF:'choir_aahs' }
+          const inst = await getSf(map[ev.synth]||'acoustic_grand_piano')
+          if (inst && inst.play) inst.play(ev.pitch, start, { duration: dur + 0.05, gain: vel })
+        } else {
+          // Basic oscillator approximation for built-in synths
+          const o = offline.createOscillator()
+          const g = offline.createGain()
+          o.type = 'triangle'
+          o.frequency.setValueAtTime(midiToFreq(ev.pitch), start)
+          // ADSR: quick attack, sustain, short release at end
+          g.gain.setValueAtTime(0.00001, start)
+          g.gain.linearRampToValueAtTime(vel * 0.5, start + 0.01)
+          g.gain.setValueAtTime(vel * 0.5, Math.max(start + 0.01, end - 0.02))
+          g.gain.linearRampToValueAtTime(0.00001, end)
+          o.connect(g).connect(master)
+          o.start(start)
+          o.stop(end + 0.02)
+        }
+      }
+      const buf = await offline.startRendering()
+      // WAV encode
+      function audioBufferToWav(abuf) {
+        const numOfChan = abuf.numberOfChannels
+        const length = abuf.length * numOfChan * 2 + 44
+        const buffer = new ArrayBuffer(length)
+        const view = new DataView(buffer)
+        const channels = []
+        let offset = 0
+        let pos = 0
+        function setUint16(data) { view.setUint16(pos, data, true); pos += 2 }
+        function setUint32(data) { view.setUint32(pos, data, true); pos += 4 }
+        // RIFF/WAVE header
+        setUint32(0x46464952); setUint32(length - 8); setUint32(0x45564157)
+        setUint32(0x20746d66); setUint32(16); setUint16(1); setUint16(numOfChan)
+        setUint32(abuf.sampleRate); setUint32(abuf.sampleRate * 2 * numOfChan)
+        setUint16(numOfChan * 2); setUint16(16); setUint32(0x61746164); setUint32(length - pos - 4)
+        for (let i = 0; i < numOfChan; i++) channels.push(abuf.getChannelData(i))
+        while (pos < length) { // interleave channels
+          for (let i = 0; i < numOfChan; i++) {
+            let sample = Math.max(-1, Math.min(1, channels[i][offset]))
+            sample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF
+            view.setInt16(pos, sample, true); pos += 2
+          }
+          offset++
+        }
+        return new Blob([buffer], { type: 'audio/wav' })
+      }
+      const wavBlob = audioBufferToWav(buf)
+      // Convert to MP3 via backend
+      const reader = new FileReader()
+      reader.onloadend = async () => {
+        try {
+          const b64 = String(reader.result||'')
+          const res = await fetch(`${BACKEND_URL.replace(/\/$/, '')}/convert/mp3`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: b64 }) })
+          if (!res.ok) throw new Error('convert_failed')
+          const blobMp3 = await res.blob()
+          const url = URL.createObjectURL(blobMp3)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = `${String(song.id||'song')}.mp3`
+          document.body.appendChild(a)
+          a.click()
+          setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url) } catch {} }, 1500)
+        } catch {}
+      }
+      reader.readAsDataURL(wavBlob)
     } catch {}
   }
   function deleteSong(id) {
@@ -1853,6 +2064,8 @@ export default function Sequencer({ socket, onBack }) {
             {isAdmin && (
               <button className="px-2 py-0.5 rounded bg-red-600/70 hover:bg-red-600/80" onClick={()=> deleteSong(songSaveId)}>Delete</button>
             )}
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={exportSongMp3}>Record Export</button>
+            <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={exportSongOffline}>Offline Export</button>
             {songsList && songsList.length>0 && (
               <select className="bg-black/40 border border-white/10 rounded px-1 py-0.5 text-white" value={songSaveId} onChange={(e)=> { setSongSaveId(e.target.value) }}>
                 {songsList.map(id => (<option key={id} value={id}>{id}</option>))}

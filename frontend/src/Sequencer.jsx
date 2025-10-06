@@ -374,24 +374,37 @@ export default function Sequencer({ socket, onBack }) {
         return new Blob([buffer], { type: 'audio/wav' })
       }
       const wavBlob = audioBufferToWav(buf)
-      // Convert to MP3 via backend
-      const reader = new FileReader()
-      reader.onloadend = async () => {
-        try {
-          const b64 = String(reader.result||'')
-          const res = await fetch(`${BACKEND_URL.replace(/\/$/, '')}/convert/mp3`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: b64 }) })
-          if (!res.ok) throw new Error('convert_failed')
-          const blobMp3 = await res.blob()
-          const url = URL.createObjectURL(blobMp3)
-          const a = document.createElement('a')
-          a.href = url
-          a.download = `${String(song.id||'song')}.mp3`
-          document.body.appendChild(a)
-          a.click()
-          setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url) } catch {} }, 1500)
-        } catch {}
+      // Prefer sending raw WAV to backend (no base64 bloat); fallback to base64 if needed
+      try {
+        const res = await fetch(`${BACKEND_URL.replace(/\/$/, '')}/convert/mp3`, { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: await wavBlob.arrayBuffer() })
+        if (!res.ok) throw new Error('convert_failed')
+        const blobMp3 = await res.blob()
+        const url = URL.createObjectURL(blobMp3)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `${String(song.id||'song')}.mp3`
+        document.body.appendChild(a)
+        a.click()
+        setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url) } catch {} }, 1500)
+      } catch {
+        const reader = new FileReader()
+        reader.onloadend = async () => {
+          try {
+            const b64 = String(reader.result||'')
+            const res = await fetch(`${BACKEND_URL.replace(/\/$/, '')}/convert/mp3`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: b64 }) })
+            if (!res.ok) throw new Error('convert_failed')
+            const blobMp3 = await res.blob()
+            const url = URL.createObjectURL(blobMp3)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `${String(song.id||'song')}.mp3`
+            document.body.appendChild(a)
+            a.click()
+            setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url) } catch {} }, 1500)
+          } catch {}
+        }
+        reader.readAsDataURL(wavBlob)
       }
-      reader.readAsDataURL(wavBlob)
     } catch {}
   }
   function deleteSong(id) {
@@ -431,7 +444,11 @@ export default function Sequencer({ socket, onBack }) {
       { name:'Reeds/Winds', items:['soprano_sax','alto_sax','tenor_sax','baritone_sax','oboe','english_horn','bassoon','clarinet','flute','recorder'] },
       { name:'Synth Leads', items:['lead_1_square','lead_2_sawtooth','lead_3_calliope','lead_4_chiff','lead_5_charang','lead_6_voice','lead_7_fifths','lead_8_bass__lead'] },
       { name:'Synth Pads', items:['pad_1_new_age','pad_2_warm','pad_3_polysynth','pad_4_choir','pad_5_bowed','pad_6_metallic','pad_7_halo','pad_8_sweep'] },
-      { name:'Synth FX', items:['fx_1_rain','fx_2_soundtrack','fx_3_crystal','fx_4_atmosphere','fx_5_brightness','fx_6_goblins','fx_7_echoes','fx_8_scifi'] }
+      { name:'Synth FX', items:['fx_1_rain','fx_2_soundtrack','fx_3_crystal','fx_4_atmosphere','fx_5_brightness','fx_6_goblins','fx_7_echoes','fx_8_scifi'] },
+      { name:'Drums & Percussion', items:[
+        'steel_drums','taiko_drum','melodic_tom','agogo','woodblock','tubular_bells','timpani',
+        'vibraphone','marimba','xylophone','glockenspiel','kalimba','synth_drum'
+      ] }
     ]
     return (
       <div className="flex flex-col gap-2">
@@ -465,6 +482,8 @@ export default function Sequencer({ socket, onBack }) {
   }
   const [sfPaletteOpen, setSfPaletteOpen] = useState(false)
   const [sfQuery, setSfQuery] = useState('')
+  // Velocity UI controls
+  const [showVelBadges, setShowVelBadges] = useState(true)
   // Instrument mode (play with computer keyboard)
   const [instOn, setInstOn] = useState(false)
   const [instOct, setInstOct] = useState(0)
@@ -487,6 +506,36 @@ export default function Sequencer({ socket, onBack }) {
   const composeVoicesRef = useRef(new Map())
   const caretStepFloatPrevRef = useRef(NaN)
   const composeLiveStepRef = useRef(0)
+  function applyVelocityDelta(delta) {
+    const to127 = (v) => Math.round(Math.max(1, Math.min(127, (Number.isFinite(v) ? v : Math.round((instVel/10)*127)))))
+    const from127 = (u) => Math.max(0.05, Math.min(1, u / 127))
+    const hasSelection = selectedIds && selectedIds.size > 0
+    if (!hasSelection) return
+    const ids = Array.from(selectedIds)
+    const ops = []
+    setSong(prev => {
+      if (!prev) return prev
+      const updateList = (list) => list.map(n => {
+        if (!ids.includes(n.id)) return n
+        const cur = to127(Math.round((n.velocity||0.8)*127))
+        const next = to127(cur + delta)
+        return { ...n, velocity: from127(next) }
+      })
+      if (prev.patterns && prev.activePatternId) {
+        const pats = prev.patterns.map(p => p.id !== prev.activePatternId ? p : { ...p, notes: updateList(p.notes||[]) })
+        return { ...prev, patterns: pats }
+      } else {
+        return { ...prev, notes: updateList(prev.notes||[]) }
+      }
+    })
+    for (const id of ids) {
+      const n = (notesForEditor||[]).find(x=>x.id===id)
+      const cur = to127(Math.round(((n?.velocity)||0.8)*127))
+      const next = to127(cur + delta)
+      ops.push({ type:'note_update', id, velocity: from127(next) })
+    }
+    if (ops.length) { try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops }) } catch {} }
+  }
   // Pending arrangement clip updates to guard against server echo reordering
   const pendingClipUpdatesRef = useRef(new Map()) // id -> { startStep?, track?, lengthSteps?, ts }
   function wrapPitchToVisible(p) {
@@ -992,7 +1041,7 @@ export default function Sequencer({ socket, onBack }) {
       // apply small lead to counteract instrument latency
       const inst = sfInstrFromSynthName(synthName) || 'acoustic_grand_piano'
       const startAt = Math.max(ctx.currentTime, time - 0.008)
-      try { playSf(pitch, startAt, durationSec, Math.max(0.05, Math.min(1, velocity||0.8)), inst) } catch {}
+      try { playSf(pitch, startAt, durationSec, Math.max(0.05, Math.min(1.5, (velocity||0.8))), inst) } catch {}
       return
     }
     // small lead for oscillator synths as well
@@ -1001,7 +1050,7 @@ export default function Sequencer({ socket, onBack }) {
     let destination = master
     let attack = 0.01
     let release = Math.min(0.25, Math.max(0.05, durationSec * 0.25))
-    const peak = Math.max(0.05, Math.min(0.6, velocity || 0.8))
+    const peak = Math.max(0.05, Math.min(1.0, (velocity || 0.8)))
     const baseFreq = midiToFreq(pitch)
 
     // Optional filter for certain patches
@@ -2044,6 +2093,20 @@ export default function Sequencer({ socket, onBack }) {
               {SYNTHS.map(s => (<option key={s} value={s}>{s}</option>))}
             </select>
             <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" onClick={()=> setSfPaletteOpen(v=>!v)}>More…</button>
+            <div className="flex items-center gap-1 ml-2">
+              <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" title="Decrease velocity (Ctrl=±1, Alt=±10)" onClick={(e)=>{
+                const fine = e.ctrlKey||e.metaKey; const coarse = e.altKey; const delta = fine? -1 : coarse? -10 : -5
+                applyVelocityDelta(delta)
+              }}>Vel −</button>
+              <button className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20" title="Increase velocity (Ctrl=±1, Alt=±10)" onClick={(e)=>{
+                const fine = e.ctrlKey||e.metaKey; const coarse = e.altKey; const delta = fine? +1 : coarse? +10 : +5
+                applyVelocityDelta(delta)
+              }}>Vel +</button>
+            </div>
+            <label className="flex items-center gap-1 ml-3 cursor-pointer select-none">
+              <input type="checkbox" checked={showVelBadges} onChange={(e)=> setShowVelBadges(e.target.checked)} />
+              <span>Vel badges</span>
+            </label>
             {sfPaletteOpen && createPortal(
               <div className="fixed top-16 right-4 z-[1000] w-[360px] max-h-[70vh] overflow-auto rounded border border-white/10 bg-black/90 p-2 shadow-lg" onMouseDown={(e)=> e.stopPropagation()}>
                 <div className="flex items-center gap-2 mb-2">
@@ -2643,7 +2706,12 @@ export default function Sequencer({ socket, onBack }) {
                     }
                   }}
                   onClick={(e) => {
-                    // double-click: adopt this note's length and synth for placement
+                    // Shift-click: adopt this note's synth for next placement
+                    if (e.shiftKey) {
+                      if (n.synth) setSynth(n.synth)
+                      return
+                    }
+                    // Double-click: adopt this note's length and synth for placement
                     if (e.detail === 2) {
                       setPlaceLenSteps(Math.max(1, n.lengthSteps || 1))
                       if (n.synth) setSynth(n.synth)
@@ -2662,10 +2730,17 @@ export default function Sequencer({ socket, onBack }) {
                   className="absolute rounded-[3px] cursor-pointer group"
                   style={{ left:x, top:y, width:w, height:14,
                            background: (typeof n.synth === 'string' && n.synth.startsWith('SF:')) ? sfGradientFor(n.synth.slice(3)) : (SYNTH_COLOR[(n && n.synth) ? n.synth : (typeof n.synth === 'string' ? n.synth : 'Triangle')] || SYNTH_COLOR.Triangle),
+                           opacity: Math.max(0.35, Math.min(1, (n.velocity||0.8))),
                            boxShadow: (selected || (selectedIds && selectedIds.has(n.id))) ? 'inset 0 0 0 2px rgba(255,255,255,0.9)' : 'inset 0 0 0 1px rgba(0,0,0,0.25)'}}
                 >
                   {/* resize handle */}
                   <div className="absolute right-0 top-0 h-full w-[6px] bg-white/10 opacity-0 group-hover:opacity-100" />
+                  {/* velocity badge */}
+                  {showVelBadges && (
+                    <div className="absolute left-0 -top-4 text-[10px] px-1 rounded bg-black/70 text-white/90 pointer-events-none select-none">
+                      {Math.round((n.velocity||0.8)*127)}
+                    </div>
+                  )}
                 </div>
               )
             })}
@@ -3194,7 +3269,55 @@ export default function Sequencer({ socket, onBack }) {
                         }
                         window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp)
                       }}
-                      onContextMenu={(e)=>{ e.preventDefault(); e.stopPropagation(); setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).filter(q => q.id !== c.id) } : prev); try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'clip_delete', id:c.id }] }) } catch {} }}
+                      onContextMenu={(e)=>{ e.preventDefault(); e.stopPropagation();
+                        // Ctrl/Cmd + right-click: immediate delete without menu
+                        if (e.ctrlKey || e.metaKey) {
+                          setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).filter(q => q.id !== c.id) } : prev)
+                          try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'clip_delete', id:c.id }] }) } catch {}
+                          return
+                        }
+                        const menu = document.createElement('div')
+                        Object.assign(menu.style, { position:'fixed', left: e.clientX+'px', top: e.clientY+'px', zIndex: 10000, background:'rgba(17,17,17,0.98)', color:'#fff', border:'1px solid rgba(255,255,255,0.15)', borderRadius:'6px', padding:'4px', boxShadow:'0 8px 24px rgba(0,0,0,0.35)' })
+                        const mk = document.createElement('div'); mk.textContent = 'Make unique'; mk.style.padding='6px 12px'; mk.style.cursor='pointer'
+                        mk.onmouseenter = ()=> mk.style.background='rgba(255,255,255,0.08)'
+                        mk.onmouseleave = ()=> mk.style.background='transparent'
+                        mk.onclick = ()=>{ try {
+                          document.body.removeChild(menu)
+                          // Duplicate the pattern and reassign this clip (optimistic + server ops)
+                          const snap = songRef.current
+                          const pat = (snap?.patterns||[]).find(p=>p.id===c.patternId)
+                          if (!pat) return
+                          const newId = 'p'+Date.now().toString(36)+Math.random().toString(36).slice(2)
+                          const newName = (pat.name?pat.name+' (copy)':'Pattern copy')
+                          // Create new note ids so local optimistic state matches emitted ops
+                          const clonedNotes = (pat.notes||[]).map(n=>({ id:'n'+Math.random().toString(36).slice(2), pitch:n.pitch, startStep:n.startStep, lengthSteps:n.lengthSteps, velocity:(n.velocity||0.8), synth:n.synth }))
+                          // Optimistically add new pattern and reassign this clip
+                          setSong(prev => {
+                            if (!prev) return prev
+                            const pats = Array.isArray(prev.patterns) ? prev.patterns.slice() : []
+                            pats.push({ id:newId, name:newName, bars: pat.bars||4, notes: clonedNotes })
+                            const clips2 = (prev.clips||[]).map(q => q.id===c.id?{...q, patternId:newId}:q)
+                            return { ...prev, patterns: pats, clips: clips2 }
+                          })
+                          // Select the new pattern in the editor
+                          if (independentPattern) { setLocalPatternId(newId) }
+                          else { try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'pattern_select', id:newId }] }) } catch {} }
+                          setSelectedClipIds(new Set([c.id]))
+                          // Emit server ops to persist
+                          const add = { type:'pattern_add', id:newId, name:newName, bars: pat.bars||4 }
+                          const addNotes = clonedNotes.map(n=>({ type:'note_add', id:n.id, pitch:n.pitch, startStep:n.startStep, lengthSteps:n.lengthSteps, velocity:(n.velocity||0.8), synth:n.synth, patternId:newId }))
+                          const upd = { type:'clip_update', id:c.id, patternId:newId }
+                          socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[add, ...addNotes, upd] })
+                        } catch {} }
+                        const del = document.createElement('div'); del.textContent = 'Delete'; del.style.padding='6px 12px'; del.style.cursor='pointer'
+                        del.onmouseenter = ()=> del.style.background='rgba(255,255,255,0.08)'
+                        del.onmouseleave = ()=> del.style.background='transparent'
+                        del.onclick = ()=>{ try { document.body.removeChild(menu) } catch {}; setSong(prev => prev ? { ...prev, clips: (prev.clips||[]).filter(q => q.id !== c.id) } : prev); try { socket?.emit?.('seq_ops', { songId, parentRev: rev, ops:[{ type:'clip_delete', id:c.id }] }) } catch {} }
+                        menu.appendChild(mk); menu.appendChild(del)
+                        document.body.appendChild(menu)
+                        const onKill = (evt)=>{ try { document.body.removeChild(menu) } catch {} ; window.removeEventListener('click', onKill) }
+                        setTimeout(()=> window.addEventListener('click', onKill), 0)
+                      }}
                     />
                   )
                 })}

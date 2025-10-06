@@ -11,7 +11,10 @@ const PORT = process.env.PORT || 3001;
 
 const app = express();
 app.use(cors({ origin: '*'}));
-app.use(express.json({ limit: '10mb' }));
+// Increase JSON limit to handle large base64 audio payloads
+app.use(express.json({ limit: '200mb' }));
+// Accept raw WAV data as well for conversion endpoint
+app.use(express.raw({ type: ['audio/wav', 'application/octet-stream'], limit: '200mb' }));
 // Timesync endpoint for NTP-like client clock sync
 app.use('/timesync', timesyncServer.requestHandler);
 
@@ -224,12 +227,18 @@ app.put('/songs/:id', (req, res) => {
 // Transcode uploaded webm/opus (base64 data URL or raw base64) to mp3; requires ffmpeg installed on server
 app.post('/convert/mp3', async (req, res) => {
   try {
-    const raw = String((req.body && req.body.data) || '');
-    let b64 = raw;
-    const m = b64.match(/^data:[^;]+;base64,(.*)$/);
-    if (m) b64 = m[1];
-    if (!b64) return res.status(400).json({ error: 'missing_data' });
-    const buf = Buffer.from(b64, 'base64');
+    let buf = null;
+    if (req.is('audio/wav') || req.is('application/octet-stream')) {
+      // Raw binary body
+      buf = Buffer.from(req.body);
+    } else {
+      const raw = String((req.body && req.body.data) || '');
+      let b64 = raw;
+      const m = b64.match(/^data:[^;]+;base64,(.*)$/);
+      if (m) b64 = m[1];
+      if (!b64) return res.status(400).json({ error: 'missing_data' });
+      buf = Buffer.from(b64, 'base64');
+    }
     const tmpDir = path.join(__dirname, 'tmp');
     try { fs.mkdirSync(tmpDir, { recursive: true }) } catch {}
     const inPath = path.join(tmpDir, `${Date.now().toString(36)}_in.webm`);
